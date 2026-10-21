@@ -4,6 +4,10 @@ LIMIVIA 的独立 ESP32 固件仓库，首版适配 **合宙 CORE ESP32-C3 简�
 
 本仓库包含 ESP-IDF 固件、Poetry/Typer 开发工具、板卡专用 skill 与协议快照，独立构建无需检出工作台。支持 GPIO、D5 LED、4 路 PWM/呼吸、ADC1 采样和 4 个本地定时任务；断线后任务继续，复位后清空。
 
+## 灵感来源与致谢
+
+LIMIVIA 受到 [wave-del 同学的 esp32-audio-web 项目](https://github.com/wave-del/esp32-audio-web) 的启发。在本项目发起者的了解与交流范围内，wave-del 同学最早提出了类似思路，其项目为 LIMIVIA 的构思提供了最初的启发。感谢他对通过网页连接和操纵物理设备这一方向的探索。
+
 ## 安装与构建
 
 依赖：Python 3.10、Poetry、ESP-IDF **6.0.2** 及其 ESP32-C3 工具链。CLI 的环境启动逻辑使用 Bash（本次在 Linux 验证）。ESP-IDF 项目位于仓库根目录，默认目标 esp32c3，Flash DIO / 4MB / 40MHz。
@@ -67,3 +71,7 @@ tests/                工具测试（不操作设备）
 docs/                 协议快照与验证记录
 .agents/skills/       仅本固件仓库使用的开发知识
 ```
+
+## 开源协议
+
+本仓库采用 **GNU Affero General Public License v3.0（AGPL-3.0-only）**，完整条款见 [LICENSE](LICENSE)。第三方依赖与另有许可声明的内容保留各自的许可证。
