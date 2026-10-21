@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "LIMIVIA ESP32 CLI",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "limivia_esp32.commands.app",
+      "console": "integratedTerminal",
+      "args": ["doctor"],
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true
+    }
+  ]
+}
