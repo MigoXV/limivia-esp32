@@ -1,0 +1,14 @@
+[
+  {"name":"parse_error","wire":"{bad","codes":[-32700]},
+  {"name":"empty_batch","wire":"[]","codes":[-32600]},
+  {"name":"invalid_request","wire":"{\"jsonrpc\":\"2.0\",\"method\":1,\"id\":true}","codes":[-32600]},
+  {"name":"legacy_v3_rejected","wire":"{\"v\":3,\"id\":1,\"op\":\"hello\",\"params\":{}}","codes":[-32600]},
+  {"name":"unknown_method","wire":"{\"jsonrpc\":\"2.0\",\"id\":\"unknown\",\"method\":\"foobar\"}","codes":[-32601]},
+  {"name":"unknown_notification","wire":"{\"jsonrpc\":\"2.0\",\"method\":\"foobar\"}","silent":true},
+  {"name":"invalid_args","wire":"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"state\",\"params\":{\"args\":\"invalid\"}}","codes":[-32602]},
+  {"name":"large_numeric_id","wire":"{\"jsonrpc\":\"2.0\",\"id\":9007199254740993,\"method\":\"state\",\"params\":[{\"session\":\"$SESSION\",\"seq\":\"$SEQ\"},{\"page\":0}]}","codes":[0],"ids":[9007199254740993]},
+  {"name":"null_id","wire":"{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"session.ping\",\"params\":{\"context\":{\"session\":\"$SESSION\",\"seq\":\"$SEQ\"}}}","codes":[0],"ids":[null]},
+  {"name":"utf8_string_id","wire":"{\"jsonrpc\":\"2.0\",\"id\":\"中文-\\\"-id\",\"method\":\"session.ping\",\"params\":{\"context\":{\"session\":\"$SESSION\",\"seq\":\"$SEQ\"}}}","codes":[0],"ids":["中文-\"-id"]},
+  {"name":"mixed_invalid_batch","wire":"[1,{\"jsonrpc\":\"2.0\",\"method\":\"foobar\"},{\"jsonrpc\":\"2.0\",\"id\":\"missing\",\"method\":\"foobar\"}]","codes":[-32600,-32601]},
+  {"name":"all_notification_batch","wire":"[{\"jsonrpc\":\"2.0\",\"method\":\"foobar\"},{\"jsonrpc\":\"2.0\",\"method\":\"unknown\"}]","silent":true}
+]

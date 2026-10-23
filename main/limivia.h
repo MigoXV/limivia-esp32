@@ -1,24 +1,13 @@
 #pragma once
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include "cJSON.h"
-
-#define PROTOCOL_VERSION 1
-#define REQUEST_MAX 1024
-#define STATUS_LED 12
-#define DEMO_LED 13
-
-typedef enum { SOURCE_USB = 0, SOURCE_BLE = 1 } source_t;
-typedef struct {
-    source_t source;
-    uint32_t generation;
-    char text[REQUEST_MAX + 1];
-} request_t;
-void transport_init(void);
-void transport_send(source_t source, uint32_t generation, const cJSON *message);
-void transport_broadcast(const cJSON *message);
-bool transport_ble_connected(void);
-bool transport_usb_connected(void);
+#include "v3.h"
 void control_init(void);
-void control_submit(const request_t *request);
+void control_submit(lv_source, uint32_t generation, const char *, size_t);
+void control_submit_message(lv_source, uint32_t, const char *, size_t, bool retained);
+void control_wake(void);
+void transport_init(void);
+bool transport_send(lv_source, uint32_t generation, const char *, size_t);
+uint32_t transport_generation(lv_source);
+bool transport_ble_connected(void);
+uint16_t transport_ble_mtu(void);
+bool network_send(lv_source, uint32_t, const char *, size_t);
+uint32_t network_generation(lv_source);
