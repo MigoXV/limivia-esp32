@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "esp32-development": {
+      "source": "magnus919/agent-skills",
+      "sourceType": "github",
+      "skillPath": "esp32-development/SKILL.md",
+      "computedHash": "d3e68f17b13141e8dab45463e98064fbb98b4fef53ee921d669429ee113c7931"
+    },
+    "grilling-embedded": {
+      "source": "iharhl/embedded-agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/grilling-embedded/SKILL.md",
+      "computedHash": "e0043932c7a0060045faa993447dfc0f8199d585228660f9c11d9a4c46aad669"
+    },
+    "review-embedded": {
+      "source": "iharhl/embedded-agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/review-embedded/SKILL.md",
+      "computedHash": "06b7c265c0317ae0696335016de09881825820d7813c31ecac9e9d6ef8c01812"
+    }
+  }
+}

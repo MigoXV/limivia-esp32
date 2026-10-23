@@ -1,7 +1,8 @@
-#include <string.h>
-#include <stdlib.h>
-#include <stdatomic.h>
 #include "limivia.h"
+#include "tx.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -13,80 +14,152 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
-// 7b9d0001-7a21-4c9b-8b30-69e5ce1d0001 (service), 0002 RX, 0003 TX.
 #define UUID_BYTES(n)                                                                              \
     0x01, 0x00, 0x1d, 0xce, 0xe5, 0x69, 0x30, 0x8b, 0x9b, 0x4c, 0x21, 0x7a, n, 0x00, 0x9d, 0x7b
 static const ble_uuid128_t service_uuid = BLE_UUID128_INIT(UUID_BYTES(1));
 static const ble_uuid128_t rx_uuid = BLE_UUID128_INIT(UUID_BYTES(2));
 static const ble_uuid128_t tx_uuid = BLE_UUID128_INIT(UUID_BYTES(3));
 static uint16_t tx_handle;
-static atomic_uint_fast16_t connection = BLE_HS_CONN_HANDLE_NONE;
-static atomic_uint_fast32_t ble_generation;
+static atomic_uint connection = BLE_HS_CONN_HANDLE_NONE, generation, mtu = 23;
 static atomic_bool subscribed;
 static uint8_t address_type;
-static SemaphoreHandle_t tx_lock;
 static char device_name[24];
-static atomic_uint_fast32_t usb_last_request;
+static lv_rx receivers[2]; // WebSocket/MQTT use their own connection-bound frame assembly.
+
+// Notifications and disconnects execute on the NimBLE host event queue, where
+// GAP handle reuse is serialized with the final generation check.
 static struct {
-    request_t request;
-    size_t used;
-    bool dropping;
-    int64_t last;
-} receivers[2];
+    struct ble_npl_event event;
+    char bytes[180];
+    size_t size;
+    uint32_t generation;
+    int64_t deadline;
+    atomic_bool busy;
+    int result;
+    SemaphoreHandle_t done;
+} notification;
+static struct {
+    struct ble_npl_event event;
+    uint32_t generation;
+    uint16_t handle;
+} termination;
 
-static void receive(source_t source, const uint8_t *data, size_t length) {
-    int64_t now = esp_timer_get_time();
-    if (receivers[source].used && now - receivers[source].last > 3000000) {
-        receivers[source].used = 0;
-        receivers[source].dropping = true; // discard the incomplete frame through its delimiter
-    }
-    receivers[source].last = now;
-    for (size_t i = 0; i < length; i++) {
-        if (data[i] == '\n') {
-            request_t *r = &receivers[source].request;
-            r->source = source;
-            r->generation = source == SOURCE_BLE ? ble_generation : 0;
-            if (receivers[source].dropping) {
-                strcpy(r->text, "!invalid-frame");
-            } else {
-                r->text[receivers[source].used] = '\0';
-            }
-            if (source == SOURCE_USB)
-                usb_last_request = (uint32_t)(now / 1000);
-            if (receivers[source].used || receivers[source].dropping)
-                control_submit(r);
-            receivers[source].used = 0;
-            receivers[source].dropping = false;
-        } else if (!receivers[source].dropping) {
-            if (receivers[source].used >= REQUEST_MAX || data[i] == 0) {
-                receivers[source].dropping = true;
-            } else {
-                receivers[source].request.text[receivers[source].used++] = (char)data[i];
-            }
-        }
-    }
+uint32_t transport_generation(lv_source source) {
+    return source == LV_BLE   ? atomic_load(&generation)
+           : source == LV_USB ? 0
+                              : network_generation(source);
 }
-
+bool transport_ble_connected(void) { return atomic_load(&connection) != BLE_HS_CONN_HANDLE_NONE; }
+uint16_t transport_ble_mtu(void) { return atomic_load(&mtu); }
+static bool current(void *ctx, uint32_t epoch) {
+    (void)ctx;
+    return epoch == atomic_load(&generation) && subscribed && transport_ble_connected();
+}
+static void notify_on_host(struct ble_npl_event *event) {
+    (void)event;
+    notification.result = -1;
+    if (current(NULL, notification.generation) &&
+        esp_timer_get_time() / 1000 < notification.deadline) {
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(notification.bytes, notification.size);
+        // notify_custom consumes om on success AND failure.
+        notification.result =
+            om && !ble_gatts_notify_custom(atomic_load(&connection), tx_handle, om) ? 1 : 0;
+    }
+    atomic_store(&notification.busy, false);
+    xSemaphoreGive(notification.done);
+}
+static void terminate_on_host(struct ble_npl_event *event) {
+    (void)event;
+    if (termination.generation == atomic_load(&generation) &&
+        termination.handle == atomic_load(&connection))
+        ble_gap_terminate(termination.handle, BLE_ERR_REM_USER_CONN_TERM);
+}
+static void abort_frame(void *ctx, uint32_t epoch) {
+    (void)ctx;
+    if (!current(NULL, epoch))
+        return;
+    subscribed = false;
+    termination.handle = atomic_load(&connection);
+    termination.generation = atomic_fetch_add(&generation, 1) + 1;
+    control_wake();
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &termination.event);
+}
+static int fragment(void *ctx, uint32_t epoch, const char *bytes, size_t size, int64_t deadline) {
+    (void)ctx;
+    if (atomic_load(&notification.busy))
+        return 0;
+    xSemaphoreTake(notification.done, 0);
+    memcpy(notification.bytes, bytes, size);
+    notification.size = size;
+    notification.generation = epoch;
+    notification.deadline = deadline;
+    atomic_store(&notification.busy, true);
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &notification.event);
+    while (esp_timer_get_time() / 1000 < deadline) {
+        if (xSemaphoreTake(notification.done, pdMS_TO_TICKS(10)) == pdTRUE)
+            return notification.result;
+        if (!current(NULL, epoch))
+            return -1;
+    }
+    return -1; // static job remains owned by the host until it finishes
+}
+static int64_t now(void *ctx) {
+    (void)ctx;
+    return esp_timer_get_time() / 1000;
+}
+static void pause_tx(void *ctx) {
+    (void)ctx;
+    vTaskDelay(pdMS_TO_TICKS(2));
+}
+bool transport_send(lv_source source, uint32_t epoch, const char *text, size_t size) {
+    if (source == LV_USB) {
+        // ESP-IDF 6.0.2 returns the entire count or zero for this ring-buffer API.
+        return usb_serial_jtag_write_bytes(text, size, pdMS_TO_TICKS(100)) == (int)size;
+    }
+    if (source != LV_BLE)
+        return network_send(source, epoch, text, size);
+    size_t payload = atomic_load(&mtu) > 3 ? atomic_load(&mtu) - 3 : 20;
+    if (payload > sizeof(notification.bytes))
+        payload = sizeof(notification.bytes);
+    return lv_tx_frame((lv_tx_io){.now = now,
+                                  .current = current,
+                                  .fragment = fragment,
+                                  .pause = pause_tx,
+                                  .abort = abort_frame},
+                       epoch, payload, text, size);
+}
+static void frame(void *ctx, const char *text, size_t n) {
+    lv_source source = (lv_source)(intptr_t)ctx;
+    control_submit(source, transport_generation(source), text, n);
+}
+static void receive(lv_source source, const uint8_t *bytes, size_t n) {
+    lv_receive(&receivers[source], bytes, n, esp_timer_get_time() / 1000, frame,
+               (void *)(intptr_t)source);
+}
 static void usb_reader(void *arg) {
-    uint8_t data[128];
+    (void)arg;
+    uint8_t bytes[128];
     for (;;) {
-        int count = usb_serial_jtag_read_bytes(data, sizeof(data), pdMS_TO_TICKS(50));
-        if (count > 0)
-            receive(SOURCE_USB, data, count);
+        int n = usb_serial_jtag_read_bytes(bytes, sizeof(bytes), pdMS_TO_TICKS(50));
+        if (n > 0)
+            receive(LV_USB, bytes, n);
     }
 }
-
 static int access_gatt(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctx, void *arg) {
+    (void)conn;
+    (void)attr;
+    (void)arg;
     if (ctx->op != BLE_GATT_ACCESS_OP_WRITE_CHR)
         return BLE_ATT_ERR_READ_NOT_PERMITTED;
+    if (!subscribed)
+        return BLE_ATT_ERR_UNLIKELY;
     uint8_t bytes[512];
-    uint16_t len;
-    if (ble_hs_mbuf_to_flat(ctx->om, bytes, sizeof(bytes), &len))
+    uint16_t n;
+    if (ble_hs_mbuf_to_flat(ctx->om, bytes, sizeof(bytes), &n))
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-    receive(SOURCE_BLE, bytes, len);
+    receive(LV_BLE, bytes, n);
     return 0;
 }
-
 static const struct ble_gatt_svc_def services[] = {
     {.type = BLE_GATT_SVC_TYPE_PRIMARY,
      .uuid = &service_uuid.u,
@@ -99,27 +172,42 @@ static const struct ble_gatt_svc_def services[] = {
               .flags = BLE_GATT_CHR_F_NOTIFY},
              {0}}},
     {0}};
-
 static void advertise(void);
+static void disconnected(void) {
+    connection = BLE_HS_CONN_HANDLE_NONE;
+    subscribed = false;
+    mtu = 23;
+    atomic_fetch_add(&generation, 1);
+    memset(&receivers[LV_BLE], 0, sizeof(receivers[LV_BLE]));
+    control_wake();
+}
 static int gap_event(struct ble_gap_event *event, void *arg) {
+    (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (!event->connect.status) {
             connection = event->connect.conn_handle;
-            ble_generation++;
+            atomic_fetch_add(&generation, 1);
+            control_wake();
         } else
             advertise();
         break;
     case BLE_GAP_EVENT_DISCONNECT:
-        connection = BLE_HS_CONN_HANDLE_NONE;
-        subscribed = false;
-        ble_generation++;
-        memset(&receivers[SOURCE_BLE], 0, sizeof(receivers[SOURCE_BLE]));
+        disconnected();
         advertise();
         break;
     case BLE_GAP_EVENT_SUBSCRIBE:
-        if (event->subscribe.attr_handle == tx_handle)
+        if (event->subscribe.attr_handle == tx_handle) {
             subscribed = event->subscribe.cur_notify;
+            if (!subscribed) {
+                memset(&receivers[LV_BLE], 0, sizeof(receivers[LV_BLE]));
+                atomic_fetch_add(&generation, 1);
+                control_wake();
+            }
+        }
+        break;
+    case BLE_GAP_EVENT_MTU:
+        mtu = event->mtu.value;
         break;
     case BLE_GAP_EVENT_ADV_COMPLETE:
         advertise();
@@ -143,92 +231,34 @@ static void advertise(void) {
     response.name_is_complete = 1;
     if (ble_gap_adv_rsp_set_fields(&response))
         return;
-    struct ble_gap_adv_params params = {0};
-    params.conn_mode = BLE_GAP_CONN_MODE_UND;
-    params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    struct ble_gap_adv_params params = {.conn_mode = BLE_GAP_CONN_MODE_UND,
+                                        .disc_mode = BLE_GAP_DISC_MODE_GEN};
     ble_gap_adv_start(address_type, NULL, BLE_HS_FOREVER, &params, gap_event, NULL);
 }
 static void on_sync(void) {
-    if (ble_hs_id_infer_auto(0, &address_type) == 0)
+    if (!ble_hs_id_infer_auto(0, &address_type))
         advertise();
 }
 static void on_reset(int reason) {
-    connection = BLE_HS_CONN_HANDLE_NONE;
-    subscribed = false;
-    ble_generation++;
-    memset(&receivers[SOURCE_BLE], 0, sizeof(receivers[SOURCE_BLE]));
+    (void)reason;
+    disconnected();
 }
 static void ble_host(void *arg) {
+    (void)arg;
     nimble_port_run();
     vTaskDelete(NULL);
 }
-
-bool transport_ble_connected(void) { return connection != BLE_HS_CONN_HANDLE_NONE; }
-bool transport_usb_connected(void) {
-    return usb_last_request &&
-           (uint32_t)((uint32_t)(esp_timer_get_time() / 1000) - usb_last_request) < 5000;
-}
-
-void transport_send(source_t source, uint32_t generation, const cJSON *message) {
-    char *json = cJSON_PrintUnformatted(message);
-    if (!json)
-        return;
-    size_t length = strlen(json);
-    char *line = malloc(length + 2);
-    if (!line) {
-        free(json);
-        return;
-    }
-    memcpy(line, json, length);
-    line[length++] = '\n';
-    free(json);
-    if (xSemaphoreTake(tx_lock, pdMS_TO_TICKS(1500)) != pdTRUE) {
-        free(line);
-        return;
-    }
-    if (source == SOURCE_USB) {
-        if (transport_usb_connected())
-            usb_serial_jtag_write_bytes(line, length, pdMS_TO_TICKS(100));
-    } else if (subscribed && connection != BLE_HS_CONN_HANDLE_NONE &&
-               generation == ble_generation) {
-        const uint16_t conn = connection;
-        uint16_t mtu = ble_att_mtu(conn);
-        size_t chunk = mtu > 3 ? mtu - 3 : 20;
-        if (chunk > 180)
-            chunk = 180;
-        for (size_t offset = 0; offset < length && generation == ble_generation;) {
-            size_t count = length - offset < chunk ? length - offset : chunk;
-            bool sent = false;
-            for (int attempt = 0; attempt < 10 && generation == ble_generation; attempt++) {
-                struct os_mbuf *om = ble_hs_mbuf_from_flat(line + offset, count);
-                if (om && ble_gatts_notify_custom(conn, tx_handle, om) == 0) {
-                    sent = true;
-                    break;
-                }
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
-            if (!sent)
-                break;
-            offset += count;
-            vTaskDelay(pdMS_TO_TICKS(2));
-        }
-    }
-    xSemaphoreGive(tx_lock);
-    free(line);
-}
-void transport_broadcast(const cJSON *message) {
-    transport_send(SOURCE_USB, 0, message);
-    transport_send(SOURCE_BLE, ble_generation, message);
-}
 void transport_init(void) {
-    tx_lock = xSemaphoreCreateMutex();
-    configASSERT(tx_lock);
-    usb_serial_jtag_driver_config_t config = {.rx_buffer_size = 2048, .tx_buffer_size = 8192};
+    usb_serial_jtag_driver_config_t config = {.rx_buffer_size = 2048, .tx_buffer_size = 8200};
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&config));
     uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_BT);
+    ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_BT));
     snprintf(device_name, sizeof(device_name), "LIMIVIA-%02X%02X", mac[4], mac[5]);
     ESP_ERROR_CHECK(nimble_port_init());
+    notification.done = xSemaphoreCreateBinary();
+    configASSERT(notification.done);
+    ble_npl_event_init(&notification.event, notify_on_host, NULL);
+    ble_npl_event_init(&termination.event, terminate_on_host, NULL);
     ble_svc_gap_init();
     ble_svc_gatt_init();
     ble_svc_gap_device_name_set(device_name);
@@ -236,6 +266,6 @@ void transport_init(void) {
     ESP_ERROR_CHECK(ble_gatts_add_svcs(services));
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
-    configASSERT(xTaskCreate(ble_host, "ble", 4096, NULL, 5, NULL) == pdPASS);
-    configASSERT(xTaskCreate(usb_reader, "usb-rx", 4096, NULL, 5, NULL) == pdPASS);
+    configASSERT(xTaskCreate(ble_host, "ble-host", 6144, NULL, 5, NULL) == pdPASS);
+    configASSERT(xTaskCreate(usb_reader, "usb-rx", 6144, NULL, 5, NULL) == pdPASS);
 }

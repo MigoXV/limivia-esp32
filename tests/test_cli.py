@@ -8,7 +8,7 @@ from limivia_esp32.commands.app import app, run_idf
 from limivia_esp32.paths import ROOT
 
 
-@pytest.mark.parametrize("command", ["flash", "verify"])
+@pytest.mark.parametrize("command", ["flash", "verify", "verify-rpc"])
 def test_hardware_operations_require_explicit_target(command):
     result = CliRunner().invoke(app, [command], env={"LIMIVIA_SERIAL_PORT": ""})
     assert result.exit_code == 2
@@ -19,6 +19,18 @@ def test_missing_idf_is_actionable(tmp_path):
     result = CliRunner().invoke(app, ["build", "--idf-path", str(tmp_path)])
     assert result.exit_code == 2
     assert "ESP-IDF 6.0.2" in result.output
+
+
+def test_ble_requires_explicit_target():
+    result = CliRunner().invoke(app, ["verify-ble"])
+    assert result.exit_code == 2
+    assert "--address" in result.output
+
+
+def test_dual_requires_both_targets():
+    result = CliRunner().invoke(app, ["verify-dual", "--port", "/dev/explicit"])
+    assert result.exit_code == 2
+    assert "--address" in result.output
 
 
 def test_idf_uses_standalone_root_and_isolated_environment(tmp_path, monkeypatch):
