@@ -158,3 +158,5 @@ IoT power.configure{auto_light_sleep?:false,modem_sleep?:"none"/"min"/"max"}；�
 错误分为协议拒绝（parse_error/invalid_request/invalid_argument/invalid_session/duplicate_request/control_required等）、资源拒绝（pin_conflict/controller_conflict/adc_unit_conflict/feature_unavailable等）和作业driver_error。driver_error保留IDF原码，result.error_code给出capacity/timeout/nack/invalid_state等含义；外部副作用标记不是“事务回滚成功”。
 
 客户端需先发现当前profile/能力，使用job完成与revision分页查询，不从通知推断成功。原生测试、USB实机、无线互通与仪器测量分别报告，见 [verification.md](verification.md)。
+
+通知字段补充：`event_sequence` 是每个会话的通知序号；`data.available.dropped` 是该资源驱动采样/事件缓冲区的累计丢弃数，不表示通知传输丢失。SDK 仅在通知序号缺口时报告 notifications.gap，gap.dropped 为缺失通知条数。固件通知队列为有界 16 格，保留发送字节上限及响应优先级；拥塞下仍通过查询恢复。

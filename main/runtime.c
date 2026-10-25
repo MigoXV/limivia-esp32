@@ -430,7 +430,9 @@ void control_init(void) {
     for (int i = 0; i < 3; ++i) {
         requests[i] = xQueueCreate(V3_ENDPOINTS, sizeof(request *));
         responses[i] = xQueueCreate(i < 2 ? 3 : 8, sizeof(response));
-        notices[i] = xQueueCreate(1, sizeof(response));
+        // One status job emits admission/completion state plus job notification.
+        // Keep a bounded burst budget; responses and the total byte cap retain priority.
+        notices[i] = xQueueCreate(16, sizeof(response));
         configASSERT(requests[i] && responses[i] && notices[i]);
     }
     for (int i = 0; i < 9; ++i) {
