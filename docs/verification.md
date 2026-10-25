@@ -73,3 +73,13 @@
 主机BlueZ没有可用adapter，本次未建立到板上Wi-Fi的测试链路。真实BLE/双链路、板上WebSocket、MQTT/TLS broker及ESP-NOW第二节点互通未运行；MQTT驱动创建成功不代表broker/TLS连接成功。
 
 外部I²C/SPI/RS485/CAN器件、外部音频/RMT输入、逻辑分析仪、已知电压、功耗和冷上电也未验证。最终新镜像验证了OTA激活/健康确认，本轮未重做首次启动失败故障注入；历史回滚记录不冒充本轮证据。当前交付仍为开发候选。
+
+## 2026-10-25：通知突发缓冲修复与 USB 验收
+
+分支 `fix/board-state-session` 从 dev 创建，实现 c92b2a0。每传输端通知队列容量由 1 增至 16，保持响应优先及总 TX 字节上限。414 项 Python 测试、Ruff、2 项原生 C 测试通过，bus/signal/iot 三种配置均构建成功。
+
+明确 USB 设备 e4:b0:63:ca:b4:78，原生 USB by-id 以 E4:B0:63:CA:B4:78-if00 结尾。升级前停止实验、确认资源清空，完整读取 4MiB Flash；备份 SHA256 为 d3f373c0a5b8948a98f6dc8161757aa5774add960ba24794638dc8ec65a230c8。沿用 OTA 激活流程写入 bus，核对上传哈希及实际启动 ELF build `9e80cd5bf1602899e3d0967c1146436554dcba6ec166666b7b09b23f27e88a0f`，boot `f5eb6a9cc04609d8`。未改分区、未格式化文件系统、未写 eFuse。
+
+SDK 0.3.0a3/server 实例经无头浏览器进行 D5/GPIO13 操作：60 秒 3,600 帧观察稳定、20 次切换、跨页面控制及关闭资源成功；通知 gap=0，lost_notifications 0→0、tx_failed 0→0。诊断仍记录 rejected 0→1、admission_rejected 0→2，不能据此声称所有准入计数为零。最终资源为空。
+
+原始备份、OTA transcript、两主题三尺寸截图与实测 JSON 在 server 本机 artifacts/board-state-session/，为 Git 忽略产物。仅 bus 镜像上板；signal/iot 此轮完成编译，未分别上板验证。BLE、网络与外部负载未测，协议读回不替代仪器或肉眼检查。
