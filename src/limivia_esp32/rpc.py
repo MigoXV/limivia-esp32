@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 
-CONTRACT = "limivia-v3-jsonrpc2"
+CONTRACT = "limivia-v3-jsonrpc2-r2"
 
 
 def _pairs(pairs):

@@ -9,5 +9,11 @@ bool transport_send(lv_source, uint32_t generation, const char *, size_t);
 uint32_t transport_generation(lv_source);
 bool transport_ble_connected(void);
 uint16_t transport_ble_mtu(void);
+void transport_ble_diagnostics(cJSON *);
+uint32_t transport_ble_interval_us(void);
 bool network_send(lv_source, uint32_t, const char *, size_t);
 uint32_t network_generation(lv_source);
+
+#ifdef LV_BLE_TRACE
+void transport_ble_trace(cJSON *);
+#endif

@@ -47,7 +47,7 @@ class Link:
                 "session": "session",
                 "profile": "bus",
                 "jsonrpc": "2.0",
-                "contract": "limivia-v3-jsonrpc2",
+                "contract": "limivia-v3-jsonrpc2-r2",
                 "sequence_high": 0,
             }
         else:

@@ -7,7 +7,7 @@
 
 #define LV_PROTOCOL 3
 #define LV_RPC_BATCH_MAX 8
-#define LV_RPC_CONTRACT "limivia-v3-jsonrpc2"
+#define LV_RPC_CONTRACT "limivia-v3-jsonrpc2-r2"
 #define LV_REQUEST_MAX 1024
 #define LV_RESPONSE_MAX 8192
 #define V3_RESOURCES 24
@@ -76,7 +76,9 @@ typedef struct {
     v3_job_state state;
     int error;
     bool external_effect;
-    bool result_expired;
+    bool result_expired, reply_pending;
+    uint32_t revision;
+    int64_t observed_us;
     size_t result_bytes;
     struct v3_work *work;
     char action[24];
@@ -140,6 +142,12 @@ size_t v3_rpc_wire(v3_core *, int, uint32_t, const char *, size_t, int64_t, bool
                    char *, size_t);
 // malloc-owned frame, starting at 512 bytes; SIZE_MAX size signals allocation loss.
 char *v3_rpc_alloc(v3_core *, int, uint32_t, const char *, size_t, int64_t, bool, size_t *);
+typedef struct v3_rpc_pending v3_rpc_pending;
+char *v3_rpc_begin(v3_core *, int, uint32_t, const char *, size_t, int64_t, bool,
+                   size_t *, v3_rpc_pending **);
+// Actor-only: poll never waits for a worker. Caller owns returned frame.
+bool v3_rpc_poll(v3_core *, v3_rpc_pending *, char **, size_t *);
+void v3_rpc_drop(v3_core *, v3_rpc_pending *);
 int v3_rpc_priority(const char *, size_t);
 cJSON *v3_rpc_notice(const v3_core *, int, const char *, cJSON *); // takes args
 bool v3_readonly(v3_core *, const char *, const cJSON *);
@@ -190,6 +198,7 @@ const char *v3_action_validate(v3_kind, const char *, const cJSON *);
 cJSON *v3_actions_json(v3_kind);
 const char *v3_operation_validate(const char *, const cJSON *);
 bool v3_action_readonly(v3_kind, const char *);
+bool v3_action_direct(v3_kind, const char *);
 bool v3_exclusive_pending(const v3_core *);
 const char *v3_flow_restore(v3_core *, uint32_t, const cJSON *);
 void v3_flow_boot_error(v3_core *, uint32_t, const char *);

@@ -8,6 +8,8 @@
 #include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
+#include "miniz.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -23,6 +25,7 @@ typedef struct {
     uint32_t generation;
     size_t size;
     bool retained;
+    int64_t received_us;
     char text[];
 } request;
 typedef struct {
@@ -30,6 +33,7 @@ typedef struct {
     uint32_t generation;
     size_t size;
     char *text;
+    int64_t queued_us;
 } response;
 typedef struct {
     v3_work *work;
@@ -38,9 +42,26 @@ typedef struct {
     cJSON *result;
 } completion;
 static v3_core core;
+// At most one ordinary frame per endpoint; management/stop remain independent.
+static struct {
+    request *request;
+    v3_rpc_pending *rpc;
+} pending[V3_ENDPOINTS];
 static QueueHandle_t requests[3], responses[3], notices[3], work_queues[9], completed;
-static atomic_uint occupied[V3_ENDPOINTS], admission_lost, tx_lost;
+static atomic_uint occupied[V3_ENDPOINTS][3], admission_lost, tx_lost;
+static void release_slot(int endpoint, int priority) {
+    atomic_fetch_sub(&occupied[endpoint][priority], 1);
+}
 static atomic_uint notice_failed;
+// Bounded diagnostics; no payloads or credentials are retained.
+static atomic_uint ble_queue_us, ble_rpc_us, ble_tx_us;
+static atomic_uint ble_queue_max_us, ble_rpc_max_us, ble_tx_max_us;
+static void latency(atomic_uint *last, atomic_uint *maximum, int64_t elapsed) {
+    unsigned value = elapsed > UINT32_MAX ? UINT32_MAX : (unsigned)elapsed;
+    atomic_store(last, value);
+    unsigned previous = atomic_load(maximum);
+    while (value > previous && !atomic_compare_exchange_weak(maximum, &previous, value)) {}
+}
 static atomic_size_t tx_bytes;
 static TaskHandle_t senders[3];
 static char encoding[512]; // actor-owned small-frame scratch; large discovery pages are transient.
@@ -160,6 +181,20 @@ static cJSON *service(void *ctx, const char *op, const cJSON *params, const char
         cJSON_AddNumberToObject(p, "tx_queued_bytes", atomic_load(&tx_bytes));
         cJSON_AddNumberToObject(p, "admission_rejected", atomic_load(&admission_lost));
         cJSON_AddNumberToObject(p, "tx_failed", atomic_load(&tx_lost));
+        cJSON_AddNumberToObject(p, "ble_rom_deflate_workspace_bytes", sizeof(tdefl_compressor));
+        cJSON_AddNumberToObject(p, "ble_deflate_workspace_bytes", 16384);
+        transport_ble_diagnostics(p);
+#ifdef LV_BLE_TRACE
+        transport_ble_trace(p);
+#endif
+        cJSON_AddNumberToObject(p, "ble_mtu", transport_ble_mtu());
+        cJSON_AddNumberToObject(p, "ble_interval_us", transport_ble_interval_us());
+        cJSON_AddNumberToObject(p, "ble_queue_us", atomic_load(&ble_queue_us));
+        cJSON_AddNumberToObject(p, "ble_queue_max_us", atomic_load(&ble_queue_max_us));
+        cJSON_AddNumberToObject(p, "ble_rpc_us", atomic_load(&ble_rpc_us));
+        cJSON_AddNumberToObject(p, "ble_rpc_max_us", atomic_load(&ble_rpc_max_us));
+        cJSON_AddNumberToObject(p, "ble_tx_us", atomic_load(&ble_tx_us));
+        cJSON_AddNumberToObject(p, "ble_tx_max_us", atomic_load(&ble_tx_max_us));
         return p;
     }
     return NULL;
@@ -181,14 +216,17 @@ void control_submit_message(lv_source endpoint, uint32_t generation, const char 
         atomic_fetch_add(&admission_lost, 1);
         return;
     }
-    unsigned bit = 1u << priority;
-    if (atomic_fetch_or(&occupied[endpoint], bit) & bit) {
+    // Match the SDK: two regular management requests plus reserved heartbeat
+    // and stop-job queries. Ordinary writes and stop still have one slot each.
+    unsigned limit = priority == 1 ? 4 : 1;
+    if (atomic_fetch_add(&occupied[endpoint][priority], 1) >= limit) {
+        release_slot(endpoint, priority);
         atomic_fetch_add(&admission_lost, 1);
         return;
     }
     request *r = malloc(sizeof(*r) + n + 1);
     if (!r) {
-        atomic_fetch_and(&occupied[endpoint], ~bit);
+        release_slot(endpoint, priority);
         atomic_fetch_add(&admission_lost, 1);
         return;
     }
@@ -196,12 +234,13 @@ void control_submit_message(lv_source endpoint, uint32_t generation, const char 
                    .priority = priority,
                    .generation = generation,
                    .size = n,
-                   .retained = retained};
+                   .retained = retained,
+                   .received_us = esp_timer_get_time()};
     memcpy(r->text, text, n);
     r->text[n] = 0;
     if (xQueueSend(requests[priority], &r, 0) != pdTRUE) {
         free(r);
-        atomic_fetch_and(&occupied[endpoint], ~bit);
+        release_slot(endpoint, priority);
         atomic_fetch_add(&admission_lost, 1);
         return;
     }
@@ -261,57 +300,105 @@ static void sender(void *arg) {
             continue;
         }
         if (r.priority >= 0)
-            atomic_fetch_and(&occupied[r.endpoint], ~(1u << r.priority));
+            release_slot(r.endpoint, r.priority);
         if (r.generation != transport_generation(r.endpoint) ||
             !transport_send(r.endpoint, r.generation, r.text, r.size)) {
             atomic_fetch_add(&tx_lost, 1);
             if (r.priority < 0)
                 atomic_fetch_add(&notice_failed, 1);
         }
+        if (r.endpoint == LV_BLE && r.queued_us)
+            latency(&ble_tx_us, &ble_tx_max_us, esp_timer_get_time() - r.queued_us);
         free(r.text);
         atomic_fetch_sub(&tx_bytes, r.size);
     }
 }
-static void process_request(request *r) {
-    if (r->generation != transport_generation(r->endpoint)) {
-        atomic_fetch_and(&occupied[r->endpoint], ~(1u << r->priority));
-        free(r);
-        return;
-    }
-    size_t n = 0;
-    char *text = v3_rpc_alloc(&core, r->endpoint, r->generation, r->text, r->size,
-                               esp_timer_get_time() / 1000, r->retained, &n);
-    if (!text || !n || n == SIZE_MAX) {
-        if (n == SIZE_MAX)
-            atomic_fetch_add(&tx_lost, 1);
-        free(text);
-        atomic_fetch_and(&occupied[r->endpoint], ~(1u << r->priority));
-        free(r);
-        return;
-    }
+static void send_reply(request *r, char *text, size_t n) {
     char *small = realloc(text, n + 1);
     if (small)
         text = small;
     response out = {.endpoint = r->endpoint, .priority = r->priority,
-                    .generation = r->generation, .text = text, .size = n};
+                    .generation = r->generation, .text = text, .size = n,
+                    .queued_us = esp_timer_get_time()};
     int lane = r->endpoint < 2 ? r->endpoint : 2;
     size_t limit = r->priority == 2 ? 32768 : 24576;
     if (atomic_load(&tx_bytes) + n > limit) {
         free(text);
         atomic_fetch_add(&tx_lost, 1);
-        atomic_fetch_and(&occupied[r->endpoint], ~(1u << r->priority));
+        release_slot(r->endpoint, r->priority);
     } else {
         atomic_fetch_add(&tx_bytes, n);
         if (xQueueSend(responses[lane], &out, 0) != pdTRUE) {
             free(text);
             atomic_fetch_sub(&tx_bytes, n);
             atomic_fetch_add(&tx_lost, 1);
-            atomic_fetch_and(&occupied[r->endpoint], ~(1u << r->priority));
+            release_slot(r->endpoint, r->priority);
         } else
             xTaskNotifyGive(senders[lane]);
     }
     free(r);
 }
+static void process_request(request *r) {
+    if (r->generation != transport_generation(r->endpoint)) {
+        release_slot(r->endpoint, r->priority);
+        free(r);
+        return;
+    }
+    int64_t started_us = esp_timer_get_time();
+    if (r->endpoint == LV_BLE)
+        latency(&ble_queue_us, &ble_queue_max_us, started_us - r->received_us);
+    size_t n = 0;
+    v3_rpc_pending *deferred = NULL;
+    char *text = v3_rpc_begin(&core, r->endpoint, r->generation, r->text, r->size,
+                               esp_timer_get_time() / 1000, r->retained, &n, &deferred);
+    if (r->endpoint == LV_BLE)
+        latency(&ble_rpc_us, &ble_rpc_max_us, esp_timer_get_time() - started_us);
+    if (!deferred && (!text || !n || n == SIZE_MAX)) {
+        if (n == SIZE_MAX)
+            atomic_fetch_add(&tx_lost, 1);
+        free(text);
+        release_slot(r->endpoint, r->priority);
+        free(r);
+        return;
+    }
+    if (deferred) {
+        pending[r->endpoint].request = r;
+        pending[r->endpoint].rpc = deferred;
+        return;
+    }
+    send_reply(r, text, n);
+}
+static void finish_pending(void) {
+    for (int i = 0; i < V3_ENDPOINTS; ++i) {
+        request *r = pending[i].request;
+        if (!r)
+            continue;
+        if (r->generation != transport_generation(i)) {
+            v3_rpc_drop(&core, pending[i].rpc);
+            pending[i].rpc = NULL;
+            pending[i].request = NULL;
+            release_slot(r->endpoint, r->priority);
+            free(r);
+            continue;
+        }
+        char *text = NULL;
+        size_t size = 0;
+        if (!v3_rpc_poll(&core, pending[i].rpc, &text, &size))
+            continue;
+        v3_rpc_drop(&core, pending[i].rpc);
+        pending[i].rpc = NULL;
+        pending[i].request = NULL;
+        if (text && size && size != SIZE_MAX)
+            send_reply(r, text, size);
+        else {
+            free(text);
+            atomic_fetch_add(&tx_lost, 1);
+            release_slot(r->endpoint, r->priority);
+            free(r);
+        }
+    }
+}
+
 static void interrupt_batch(void *ctx) {
     (void)ctx;
     static bool servicing_stop;
@@ -334,10 +421,12 @@ static void execute_task(void *arg) {
     for (;;) {
         completion done;
         for (int i = 0; i < V3_JOBS && xQueueReceive(completed, &done, 0) == pdTRUE; ++i) {
+            v3_tick(&core, esp_timer_get_time() / 1000);
             v3_complete(&core, done.work, done.error, done.external, done.result);
             emit(-1, 1, "job.finished", done.work->resource, done.work->job, 0, 0);
             v3_work_free(done.work);
         }
+        finish_pending();
         v3_tick(&core, esp_timer_get_time() / 1000);
         for (int lane = 0; lane < 8; ++lane)
             if (atomic_exchange(&worker_idle[lane], false)) {

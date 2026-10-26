@@ -1,4 +1,5 @@
 #include "peripherals.h"
+#include "pwm_latch.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/temperature_sensor.h"
@@ -26,6 +27,8 @@ static adc_oneshot_unit_handle_t adc_unit;
 static int adc_users;
 static bool isr_installed;
 static bool fade_installed;
+// PWM work is serialized on lane 0; retain the actual previous timer period.
+static uint32_t pwm_timer_frequency[LEDC_TIMER_MAX];
 static SemaphoreHandle_t flash_guard;
 static atomic_uint realtime;
 static bool flash_writing;
@@ -156,7 +159,23 @@ static void gpio_edge(void *arg) {
     if (wake)
         portYIELD_FROM_ISR();
 }
-static int simple_open(v3_hardware *h) {
+typedef struct { v3_hardware *h; const v3_work *w; } pwm_wait_context;
+static uint32_t pwm_read(void *ctx) {
+    pwm_wait_context *p = ctx;
+    return ledc_get_duty(LEDC_LOW_SPEED_MODE, p->h->channel);
+}
+static int64_t pwm_now(void *ctx) { (void)ctx; return esp_timer_get_time(); }
+static bool pwm_cancelled(void *ctx) { return v3_cancelled(((pwm_wait_context *)ctx)->w); }
+static void pwm_wait_tick(void *ctx) { (void)ctx; vTaskDelay(1); }
+static int pwm_wait_latched(v3_hardware *h, const v3_work *w, uint32_t target, uint32_t frequency) {
+    pwm_wait_context ctx = {.h = h, .w = w};
+    v3_pwm_latch_io io = {.ctx = &ctx, .read = pwm_read, .now_us = pwm_now,
+                          .cancelled = pwm_cancelled, .wait_tick = pwm_wait_tick};
+    v3_pwm_latch_result result = v3_pwm_latch(&io, frequency, target);
+    return result == V3_PWM_READY ? ESP_OK : result == V3_PWM_TIMEOUT ? ESP_ERR_TIMEOUT
+                                                                           : ESP_ERR_INVALID_STATE;
+}
+static int simple_open(v3_hardware *h, const v3_work *w) {
     const cJSON *cfg = v3_hw_config(h), *pins = v3_hw_pins(h);
     int pin = v3_int(pins, "pin", -1), err;
     if (h->kind == V_GPIO || h->kind == V_TIMER) {
@@ -216,8 +235,14 @@ static int simple_open(v3_hardware *h) {
                                  .duty_resolution = v3_int(cfg, "resolution", 10),
                                  .freq_hz = v3_int(cfg, "frequency", 1000),
                                  .clk_cfg = LEDC_USE_XTAL_CLK};
+        uint32_t previous_frequency = pwm_timer_frequency[h->timer];
         if ((err = ledc_timer_config(&t)))
             return err;
+        uint32_t frequency = ledc_get_freq(LEDC_LOW_SPEED_MODE, h->timer);
+        pwm_timer_frequency[h->timer] = frequency;
+        // A frequency/resolution change can still latch on the preceding period.
+        if (previous_frequency && previous_frequency < frequency)
+            frequency = previous_frequency;
         ledc_channel_config_t ch = {.gpio_num = pin,
                                     .speed_mode = LEDC_LOW_SPEED_MODE,
                                     .channel = h->channel,
@@ -229,7 +254,7 @@ static int simple_open(v3_hardware *h) {
             return err;
         h->installed = true;
         h->start = esp_timer_get_time() / 1000;
-        return ESP_OK;
+        return pwm_wait_latched(h, w, ch.duty, frequency);
     }
     if (h->kind == V_ADC) {
         if (!adc_unit) {
@@ -337,6 +362,8 @@ cJSON *v3_hw_status(v3_hardware *h) {
     v3_add_u32(p, "errors", atomic_load(&h->errors));
     v3_add_u32(p, "sequence", atomic_load(&h->sequence));
     cJSON_AddNumberToObject(p, "pending_events", h->events ? uxQueueMessagesWaiting(h->events) : 0);
+    if (h->kind == V_GPIO)
+        cJSON_AddStringToObject(p, "mode", v3_str(v3_hw_config(h), "mode", "input"));
     if (h->kind == V_GPIO || h->kind == V_TIMER)
         cJSON_AddNumberToObject(p, "level",
                                 gpio_get_level(__builtin_ctz(h->pins)) ^
@@ -377,16 +404,17 @@ static int simple_call(v3_hardware *h, const v3_work *w, cJSON **result) {
         return adc_read(h, result);
     if (h->kind == V_GPIO) {
         if (!strcmp(a, "read")) {
-            *result = cJSON_CreateObject();
-            cJSON_AddNumberToObject(*result, "level",
-                                    gpio_get_level(pin) ^ v3_bool(cfg, "invert", false));
+            *result = v3_hw_status(h);
             return ESP_OK;
         }
         if (!strcmp(a, "write")) {
             if (!strcmp(v3_str(cfg, "mode", "input"), "input") ||
                 !v3_integer(v3_get(p, "level"), 0, 1))
                 return ESP_ERR_INVALID_ARG;
-            return gpio_set_level(pin, v3_int(p, "level", 0) ^ v3_bool(cfg, "invert", false));
+            int err = gpio_set_level(pin, v3_int(p, "level", 0) ^ v3_bool(cfg, "invert", false));
+            if (!err)
+                *result = v3_hw_status(h);
+            return err;
         }
     }
     if (h->kind == V_PWM && (!strcmp(a, "duty") || !strcmp(a, "fade"))) {
@@ -416,7 +444,13 @@ static int simple_call(v3_hardware *h, const v3_work *w, cJSON **result) {
             return ledc_fade_start(LEDC_LOW_SPEED_MODE, h->channel, LEDC_FADE_NO_WAIT);
         }
         int err = ledc_set_duty(LEDC_LOW_SPEED_MODE, h->channel, duty);
-        return err ? err : ledc_update_duty(LEDC_LOW_SPEED_MODE, h->channel);
+        if (!err)
+            err = ledc_update_duty(LEDC_LOW_SPEED_MODE, h->channel);
+        if (!err)
+            err = pwm_wait_latched(h, w, duty, ledc_get_freq(LEDC_LOW_SPEED_MODE, h->timer));
+        if (!err)
+            *result = v3_hw_status(h);
+        return err;
     }
     if (h->kind == V_TEMPERATURE && !strcmp(a, "read")) {
         float c;
@@ -438,6 +472,8 @@ int v3_peripheral(v3_work *w, cJSON **out, bool *external) {
     bool signal = w->kind == V_ADC_CONT || w->kind == V_I2S || w->kind == V_SDM ||
                   w->kind == V_RMT_TX || w->kind == V_RMT_RX;
     if (!strcmp(w->action, "open")) {
+        if (v3_cancelled(w))
+            return ESP_ERR_INVALID_STATE;
         if (h->id)
             return ESP_ERR_INVALID_STATE;
         atomic_fetch_or(&v3_lane_slots[v3_lane(w->kind, w->controller)], 1u << w->slot);
@@ -456,10 +492,14 @@ int v3_peripheral(v3_work *w, cJSON **out, bool *external) {
         const cJSON *pins = v3_hw_pins(h);
         for (const cJSON *v = pins ? pins->child : NULL; v; v = v->next)
             h->pins |= 1u << v->valueint;
+        *external = true; // Initialization may already configure hardware before failing.
         int err = power_acquire(h);
         if (err)
             return err;
-        return simple ? simple_open(h) : signal ? v3_signal_open(h, w) : v3_bus_open(h, w);
+        err = simple ? simple_open(h, w) : signal ? v3_signal_open(h, w) : v3_bus_open(h, w);
+        if (!err && w->kind == V_GPIO)
+            *out = v3_hw_status(h);
+        return err;
     }
     if (!h->id)
         return !strcmp(w->action, "close") ? ESP_OK : ESP_ERR_INVALID_STATE;
@@ -501,7 +541,8 @@ int v3_peripheral(v3_work *w, cJSON **out, bool *external) {
         for (int i = 0; i < count; ++i) {
             int slot = cJSON_GetArrayItem(slots, i)->valueint;
             if (slot < 0 || slot >= V3_RESOURCES || v3_hardware_slots[slot].kind != V_GPIO ||
-                !v3_hardware_slots[slot].id)
+                v3_hardware_slots[slot].id != (uint32_t)v3_int(cJSON_GetArrayItem(resources, i), "resource", 0) ||
+                v3_hardware_slots[slot].instance != (uint32_t)v3_int(cJSON_GetArrayItem(resources, i), "instance", 0))
                 return ESP_ERR_INVALID_STATE;
         }
         *out = cJSON_CreateObject();
@@ -533,6 +574,9 @@ int v3_peripheral(v3_work *w, cJSON **out, bool *external) {
     }
     if (!strcmp(w->action, "events"))
         return events_read(h, out);
+    if ((w->kind == V_GPIO && !strcmp(w->action, "write")) ||
+        (w->kind == V_PWM && (!strcmp(w->action, "duty") || !strcmp(w->action, "fade"))))
+        *external = true;
     return simple   ? simple_call(h, w, out)
            : signal ? v3_signal_call(h, w, out, external)
                     : v3_bus_call(h, w, out, external);

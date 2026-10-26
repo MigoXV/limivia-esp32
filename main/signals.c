@@ -43,7 +43,9 @@ int v3_rmt_sync(const v3_work *w, cJSON **out, bool *external) {
             return ESP_ERR_INVALID_ARG;
         v3_hardware *h = &v3_hardware_slots[slot];
         members[i] = h;
-        if (!h->id || h->kind != V_RMT_TX || !h->handle)
+        if (h->id != (uint32_t)v3_int(cJSON_GetArrayItem(resources, i), "resource", 0) ||
+            h->instance != (uint32_t)v3_int(cJSON_GetArrayItem(resources, i), "instance", 0) ||
+            h->kind != V_RMT_TX || !h->handle)
             return ESP_ERR_INVALID_STATE;
         if (h->installed && rmt_tx_wait_all_done(h->handle, 0) != ESP_OK)
             return ESP_ERR_INVALID_STATE;

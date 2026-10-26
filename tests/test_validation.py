@@ -44,7 +44,7 @@ class FakeLink:
                 "build_id": "build",
                 "capability_pages": 1,
                 "jsonrpc": "2.0",
-                "contract": "limivia-v3-jsonrpc2",
+                "contract": "limivia-v3-jsonrpc2-r2",
                 "sequence_high": 0,
             }
         elif op == "capabilities":

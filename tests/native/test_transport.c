@@ -82,6 +82,7 @@ static void test_ble_frame_deadline_and_generation(void) {
     TEST_ASSERT_TRUE(lv_tx_frame(io, 1, 20, line, sizeof(line)));
     TEST_ASSERT_EQUAL(20, tx.max_fragment);
     TEST_ASSERT_EQUAL(52, tx.sends);
+    TEST_ASSERT_EQUAL(0, tx.now); // No artificial delay on successful notifications.
     memset(&tx, 0, sizeof(tx));
     tx.generation = 1;
     tx.fail_after = 1;

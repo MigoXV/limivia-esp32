@@ -11,7 +11,7 @@ description: 在 limivia-esp32 仓库开发、构建、烧录与验证合宙 COR
 
 - 板型、引脚、电气边界或驱动参数：读 [板卡与芯片](references/board-and-chip.md)，区分芯片能力、板上接线和本固件开放范围。
 - 构建、烧录、原生 USB 故障或实机验证：读 [开发与恢复](references/development.md)。串口编号与 MAC 仅为历史观察。
-- 命令、分片或能力变更：读 [v3 契约](../../../docs/protocol.md) 和 [外设矩阵](../../../docs/peripheral-matrix.md)。本轮用户授权固件先行，不改SDK/server；历史上游来源在 [v2快照](../../../docs/protocol-v2.md) 和 [v1快照](../../../docs/protocol-v1.md)。跨仓库适配必须核对版本与测试，现有SDK0.3.0a1使用历史自定义v3，不能连接JSON-RPC v3；必须核对contract=limivia-v3-jsonrpc2。
+- 命令、分片或能力变更：读 [v3 契约](../../../docs/protocol.md) 和 [外设矩阵](../../../docs/peripheral-matrix.md)。本轮用户授权固件、SDK 和 server 协同修改；历史上游来源在 [v2快照](../../../docs/protocol-v2.md) 和 [v1快照](../../../docs/protocol-v1.md)。跨仓库适配必须核对版本与测试，历史SDK0.3.0a1不能连接JSON-RPC v3，当前配套SDK为0.3.0a7；必须核对contract=limivia-v3-jsonrpc2-r2。
 
 ## 不可丢失的工程约束
 

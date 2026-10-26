@@ -1,5 +1,7 @@
 #include "limivia.h"
 #include "tx.h"
+#include "ble_wire.h"
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdatomic.h>
@@ -22,6 +24,23 @@ static const ble_uuid128_t tx_uuid = BLE_UUID128_INIT(UUID_BYTES(3));
 static uint16_t tx_handle;
 static atomic_uint connection = BLE_HS_CONN_HANDLE_NONE, generation, mtu = 23;
 static atomic_bool subscribed;
+static atomic_uint interval_us;
+static atomic_bool parameters_requested, parameters_updated;
+static atomic_uint parameter_request_status;
+static atomic_uint connects, connect_failures, disconnects, last_disconnect, parameter_status;
+static void connection_parameters(void);
+void transport_ble_diagnostics(cJSON *p) {
+    connection_parameters();
+    cJSON_AddBoolToObject(p, "ble_parameter_requested", atomic_load(&parameters_requested));
+    cJSON_AddBoolToObject(p, "ble_parameter_updated", atomic_load(&parameters_updated));
+    cJSON_AddNumberToObject(p, "ble_parameter_request_status", atomic_load(&parameter_request_status));
+    cJSON_AddBoolToObject(p, "ble_connected", transport_ble_connected());
+    cJSON_AddNumberToObject(p, "ble_connects", atomic_load(&connects));
+    cJSON_AddNumberToObject(p, "ble_connect_failures", atomic_load(&connect_failures));
+    cJSON_AddNumberToObject(p, "ble_disconnects", atomic_load(&disconnects));
+    cJSON_AddNumberToObject(p, "ble_last_disconnect_reason", atomic_load(&last_disconnect));
+    cJSON_AddNumberToObject(p, "ble_parameter_status", atomic_load(&parameter_status));
+}
 static uint8_t address_type;
 static char device_name[24];
 static lv_rx receivers[2]; // WebSocket/MQTT use their own connection-bound frame assembly.
@@ -30,7 +49,7 @@ static lv_rx receivers[2]; // WebSocket/MQTT use their own connection-bound fram
 // GAP handle reuse is serialized with the final generation check.
 static struct {
     struct ble_npl_event event;
-    char bytes[180];
+    char bytes[512];
     size_t size;
     uint32_t generation;
     int64_t deadline;
@@ -51,6 +70,12 @@ uint32_t transport_generation(lv_source source) {
 }
 bool transport_ble_connected(void) { return atomic_load(&connection) != BLE_HS_CONN_HANDLE_NONE; }
 uint16_t transport_ble_mtu(void) { return atomic_load(&mtu); }
+uint32_t transport_ble_interval_us(void) { return atomic_load(&interval_us); }
+static void connection_parameters(void) {
+    struct ble_gap_conn_desc desc;
+    if (!ble_gap_conn_find(atomic_load(&connection), &desc))
+        atomic_store(&interval_us, (unsigned)desc.conn_itvl * 1250);
+}
 static bool current(void *ctx, uint32_t epoch) {
     (void)ctx;
     return epoch == atomic_load(&generation) && subscribed && transport_ble_connected();
@@ -121,18 +146,64 @@ bool transport_send(lv_source source, uint32_t epoch, const char *text, size_t s
     size_t payload = atomic_load(&mtu) > 3 ? atomic_load(&mtu) - 3 : 20;
     if (payload > sizeof(notification.bytes))
         payload = sizeof(notification.bytes);
-    return lv_tx_frame((lv_tx_io){.now = now,
+    const char *bytes = text;
+    uint8_t *packed = NULL;
+#ifdef LV_BLE_BINARY
+    if (size && text[size - 1] == '\n') --size;
+    packed = malloc(size + LV_WIRE_HEADER);
+    size_t packed_size = packed ? lv_wire_pack((const uint8_t *)text, size, packed, size + LV_WIRE_HEADER) : 0;
+    if (!packed_size) { free(packed); abort_frame(NULL, epoch); return false; }
+    bytes = (const char *)packed;
+    size = packed_size;
+#endif
+    bool ok = lv_tx_frame((lv_tx_io){.now = now,
                                   .current = current,
                                   .fragment = fragment,
                                   .pause = pause_tx,
                                   .abort = abort_frame},
-                       epoch, payload, text, size);
+                       epoch, payload, bytes, size);
+    free(packed);
+    return ok;
 }
 static void frame(void *ctx, const char *text, size_t n) {
     lv_source source = (lv_source)(intptr_t)ctx;
     control_submit(source, transport_generation(source), text, n);
 }
+#ifdef LV_BLE_BINARY
+static struct { uint8_t bytes[LV_REQUEST_MAX + LV_WIRE_HEADER]; size_t used, expected; int64_t last; } binary_rx;
+static bool receive_binary(const uint8_t *bytes, size_t n) {
+    int64_t at = esp_timer_get_time() / 1000;
+    if (binary_rx.used && at - binary_rx.last > 3000) return false;
+    binary_rx.last = at;
+    while (n) {
+        size_t expected = binary_rx.expected ? binary_rx.expected : LV_WIRE_HEADER;
+        size_t take = expected - binary_rx.used;
+        if (take > n) take = n;
+        memcpy(binary_rx.bytes + binary_rx.used, bytes, take);
+        binary_rx.used += take; bytes += take; n -= take;
+        if (binary_rx.used < LV_WIRE_HEADER) continue;
+        if (!binary_rx.expected) {
+            binary_rx.expected = lv_wire_size(binary_rx.bytes, LV_REQUEST_MAX);
+            if (!binary_rx.expected) return false;
+        }
+        if (binary_rx.used == binary_rx.expected) {
+            uint8_t text[LV_REQUEST_MAX + 1]; size_t used;
+            if (!lv_wire_unpack(binary_rx.bytes, binary_rx.used, text, LV_REQUEST_MAX, &used)) return false;
+            text[used] = 0;
+            frame((void *)(intptr_t)LV_BLE, (const char *)text, used);
+            binary_rx.used = binary_rx.expected = 0;
+        }
+    }
+    return true;
+}
+#endif
 static void receive(lv_source source, const uint8_t *bytes, size_t n) {
+#ifdef LV_BLE_BINARY
+    if (source == LV_BLE) {
+        if (!receive_binary(bytes, n)) abort_frame(NULL, atomic_load(&generation));
+        return;
+    }
+#endif
     lv_receive(&receivers[source], bytes, n, esp_timer_get_time() / 1000, frame,
                (void *)(intptr_t)source);
 }
@@ -177,8 +248,15 @@ static void disconnected(void) {
     connection = BLE_HS_CONN_HANDLE_NONE;
     subscribed = false;
     mtu = 23;
+    interval_us = 0;
+    parameters_requested = false;
+    parameters_updated = false;
+    parameter_request_status = 0;
     atomic_fetch_add(&generation, 1);
     memset(&receivers[LV_BLE], 0, sizeof(receivers[LV_BLE]));
+#ifdef LV_BLE_BINARY
+    memset(&binary_rx, 0, sizeof(binary_rx));
+#endif
     control_wake();
 }
 static int gap_event(struct ble_gap_event *event, void *arg) {
@@ -187,24 +265,46 @@ static int gap_event(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_CONNECT:
         if (!event->connect.status) {
             connection = event->connect.conn_handle;
+            atomic_fetch_add(&connects, 1);
             atomic_fetch_add(&generation, 1);
             control_wake();
-        } else
+        } else {
+            atomic_fetch_add(&connect_failures, 1);
             advertise();
+        }
         break;
     case BLE_GAP_EVENT_DISCONNECT:
+        atomic_fetch_add(&disconnects, 1);
+        atomic_store(&last_disconnect, event->disconnect.reason);
         disconnected();
         advertise();
         break;
     case BLE_GAP_EVENT_SUBSCRIBE:
         if (event->subscribe.attr_handle == tx_handle) {
             subscribed = event->subscribe.cur_notify;
+            // Wait for a usable GATT link. One proposal per connection; rejection
+            // leaves the central's parameters in force and never blocks an RPC.
+            if (subscribed && !atomic_exchange(&parameters_requested, true)) {
+                const struct ble_gap_upd_params params = {
+                    .itvl_min = 12, .itvl_max = 24, .latency = 0,
+                    .supervision_timeout = 400, .min_ce_len = 0, .max_ce_len = 0};
+                atomic_store(&parameter_request_status,
+                             ble_gap_update_params(event->subscribe.conn_handle, &params));
+            }
+
             if (!subscribed) {
                 memset(&receivers[LV_BLE], 0, sizeof(receivers[LV_BLE]));
+#ifdef LV_BLE_BINARY
+    memset(&binary_rx, 0, sizeof(binary_rx));
+#endif
                 atomic_fetch_add(&generation, 1);
                 control_wake();
             }
         }
+        break;
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        atomic_store(&parameter_status, event->conn_update.status);
+        atomic_store(&parameters_updated, event->conn_update.status == 0);
         break;
     case BLE_GAP_EVENT_MTU:
         mtu = event->mtu.value;

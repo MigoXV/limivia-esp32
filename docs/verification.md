@@ -1,8 +1,36 @@
+# 2026-10-25：固件 0.3.0a4 BLE实机对照
+
+414项Python测试、三项生产C原生CTest（ASan/UBSan）、本次参数候选bus/signal/iot构建通过。程序基线1526d7a，正常bus ELF为618aa4944403692d81ff27e8ade4bf09452fc207b8ae0557c1b19390ddc91e1c，镜像SHA256为d02bccfd4602e48fbb5e9184a1aa9b607457b2f89329a490527cd20e0602ac6e。正常构建二进制与ACL包装均关闭。
+
+管理容量对齐SDK为1/4/1，保留拥塞退避和完整帧截止；等GATT订阅完成后才单次提议15～30ms/4秒连接参数，拒绝不影响RPC。中心实际接受30ms，ATT MTU185。a4 SDK配套下100次ping、100次状态页、30次快照和10次能力发现均成功，完整快照均值约0.40秒。
+
+压缩候选已实测相同只读矩阵，P95收益不足且部分指标回退，不启用，不宣称其持续或跨平台验收通过。后台观察下GPIO13百次写入回读成功；持续段按用户要求在28.54分钟停止，622轮ping/完整快照均成功；没有完成一小时或最终平台矩阵。早期原镜像与最小NimBLE程序均复现GATT前故障，物理断电后才重新取得业务样本；没有单方面归因固件或适配器。
+
+补做真实Chromium工作台BLE功能短测：点亮/熄灭GPIO13并分别回读1/0，释放后资源为空，页面刷新仍ready且保持BLE，页面异常0。首轮脚本的资源字段层级错误已保留证据并修正，没有重复点亮写入；不扩大为全外设通过。
+
+完整分布、真实HCI证据与尚未完成项见 [工作台专项记录](../../limivia-server/docs/ble-a4-verification.md)。Windows本轮未测；原始artifacts不会随合并迁移。所有刷写仅目标应用槽，没有改分区或eFuse，也没有推送。
+
 # JSON-RPC v3 最终验证记录
 
 日期：2026-10-23。目标：合宙CORE ESP32-C3简约版，原生USB、外置4MB/DIO/40MHz，C3 rev0.4，MAC `e4:b0:63:ca:b4:78`。固件0.3.0-dev，业务协议仍为3，JSON-RPC为2.0，contract为 `limivia-v3-jsonrpc2`。
 
 本轮仅修改固件及仓库开发工具。历史自定义v3已失效；现有SDK0.3.0a1和旧server均未适配，不能据相同版本号推断兼容。旧协议的事实保存在 [历史验证](verification-custom-v3.md)，当前契约见 [协议](protocol.md)。
+
+## 2026-10-25 第二块新板烧录
+
+目标MAC `90:64:9b:45:e9:0c`，原生USB、ESP32-C3 rev0.4、4MB Flash（manufacturer 20 / device 4016）。写入上一块新板验证通过的bus镜像，build_id `e70bd914b180b0a6954d4ba34580eda9295082d5e34ecaba707160e76b6ef3e1`，bin SHA256 `d8444775fd01a685ea4fa827c5841db58a3ec9258a52f008676b2511256faf0f`。stub完整读取中断，失败日志保留；ROM/no-stub完整备份4MB并核验长度/SHA后烧录，写入哈希校验通过。清除旧NVS并显式初始化LittleFS。
+
+证据在 `artifacts/new-board-45e90c/`。有线verify通过能力分页、D5/GPIO13高低数字读回、ADC0与GPIO互斥复用、UART内部回环、温度诊断及USB拥塞停止；补测GPIO10高低数字读回，清理确认无剩余资源。未进行外接LED物理测量或BLE测试，本次没有修改固件业务代码。
+
+## 2026-10-25 新板有线烧录
+
+目标为 `/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_E4:B0:63:CA:BD:D4-if00`，MAC `e4:b0:63:ca:bd:d4`，ESP32-C3 rev0.4、外置4MB Flash。完整备份及全部失败/成功记录保存在 `artifacts/new-board-cabdd4/`；首次旧 NVS/文件区清除后重新初始化 LittleFS。
+
+原静默配置 `ESP_CONSOLE_NONE` 在此板多次握手超时；USB控制台配置可正常运行。交付配置保留 `ESP_CONSOLE_USB_SERIAL_JTAG` 初始化，并关闭默认应用日志、bootloader日志和副控制台，未保留临时HAL发送尝试。低层根因尚未单独证明，不能归因于SDK或旧数据。已有build目录需显式更新sdkconfig或重新配置，defaults不会覆盖旧配置。
+
+最终bus ELF build_id为 `e70bd914b180b0a6954d4ba34580eda9295082d5e34ecaba707160e76b6ef3e1`，bin SHA256为 `d8444775fd01a685ea4fa827c5841db58a3ec9258a52f008676b2511256faf0f`。写入哈希校验通过；`verification-quiet.json`确认能力分页、D5/GPIO13高低电平读回、ADC0与GPIO互斥/复用、UART内部回环、温度、诊断、USB拥塞下停止及最终空资源。`gpio10-storage.json`确认GPIO10高/低读回、LittleFS初始化、最终无资源。数字读回与内部回环不是外部LED亮度或外接线路互通测量。
+
+SDK 0.3.0a3经server重新连接后 ready、stale=false、snapshot_sync=current，工作台持有新板连接。Python414项测试与Ruff通过。本次仅重建并烧录bus，未重建signal/iot或测试BLE。
 
 ## 冻结镜像与软件验证
 
@@ -83,3 +111,13 @@
 SDK 0.3.0a3/server 实例经无头浏览器进行 D5/GPIO13 操作：60 秒 3,600 帧观察稳定、20 次切换、跨页面控制及关闭资源成功；通知 gap=0，lost_notifications 0→0、tx_failed 0→0。诊断仍记录 rejected 0→1、admission_rejected 0→2，不能据此声称所有准入计数为零。最终资源为空。
 
 原始备份、OTA transcript、两主题三尺寸截图与实测 JSON 在 server 本机 artifacts/board-state-session/，为 Git 忽略产物。仅 bus 镜像上板；signal/iot 此轮完成编译，未分别上板验证。BLE、网络与外部负载未测，协议读回不替代仪器或肉眼检查。
+
+## 0.3.0a7：正式 WebSocket 修复与 PWM 确认（2026-10-26）
+
+源代码 `e6db370`、`e03dc45`、`562623a`，SDK 配套 0.3.0a7 / r2。ESP-IDF 6 握手后回调负责两槽 WS 初始化和清理，每连接 TCP_NODELAY；拒绝空 TEXT 与消息级分片。PWM 创建/duty 等真实量化占空比读回，工作线程有界取消等待，创建兼顾切换前较慢周期。实验 TCP 端口、强制 Wi-Fi 不省电、主机 ARP 设置未进入正式代码。
+
+B47A（e4:b0:63:ca:b4:78）仅刷应用 0x20000：bus BIN SHA256 `0a073ae1bed07bfe66d7e4419561b3602d84d46e420a23113c3dd42fe01c4fdf`，hello build_id `385ac1152c37848011da14bfd3758cf844c65408758eb559d087ffc5387e676d`。最终短测 USB/WS 各 10 次 GPIO13 切换、各 5 次 1kHz/10bit PWM 更新即时确认正确；另测 USB 10Hz/14bit 后 WS 恢复 1kHz/10bit。WS 双连接、第三连接容量拒绝、槽位复用及两种无效帧后的重连均通过。共 60 条计时请求无失败，不是长期稳定性或物理波形证明。
+
+排查保留 1Hz/14bit 驱动拒绝，以及尚未兼顾旧低频周期时的两次 open timeout；绑定后重设 duty 的尝试无效，未保留。最终按前后较慢周期预算解决，未通过回显请求值掩盖旧值。
+
+Python 414 项、Ruff、四组 ASan/UBSan 原生测试与三个 profile 编译通过。完整计时分布、失败记录和当前限制见本次独立 limivia-server 仓库 `docs/a7-verification.md`；原始日志在该仓库忽略目录 `artifacts/a7/`，不是固件运行/构建依赖。BLE/MQTT 与 Windows 本轮未重测。

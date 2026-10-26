@@ -203,7 +203,7 @@ static bool config_valid(v3_kind kind, const cJSON *cfg) {
 const char *v3_plan(v3_core *c, const cJSON *p, v3_resource *out) {
     memset(out, 0, sizeof(*out));
     out->controller = out->channel = out->timer = -1;
-    if (!v3_keys(p, "kind parent controller pins config"))
+    if (!v3_keys(p, "kind parent parent_instance controller pins config"))
         return "invalid_argument";
     const char *kind = v3_str(p, "kind", "");
     int k = -1;
@@ -277,7 +277,8 @@ const char *v3_plan(v3_core *c, const cJSON *p, v3_resource *out) {
     out->parent = v3_int(p, "parent", 0);
     v3_resource *parent = v3_find(c, out->parent);
     if (k == V_I2C_DEVICE || k == V_SPI_DEVICE) {
-        if (!parent || parent->state != V_READY ||
+        if (!parent || parent->instance != (uint32_t)v3_int(p, "parent_instance", 0) ||
+            parent->state != V_READY ||
             parent->kind != (k == V_I2C_DEVICE ? V_I2C : V_SPI))
             return "invalid_parent";
         if (parent->busy || parent->flow)

@@ -46,7 +46,14 @@ static cJSON *call_at(int endpoint, uint32_t generation, const char *op, const c
         cJSON_AddStringToObject(context, "control", core.control);
         cJSON_AddNumberToObject(context, "seq", sequence);
     }
-    cJSON_AddItemToObject(params, "args", cJSON_Parse(params_text));
+    cJSON *args = cJSON_Parse(params_text);
+    // Fixture resources use instance == ID; r2 requires both on every operation.
+    if ((!strcmp(op, "resource.call") || !strcmp(op, "resource.close") || !strcmp(op, "resource.recover")) &&
+        !v3_get(args, "instance"))
+        v3_add_u32(args, "instance", v3_int(args, "resource", 1));
+    if (v3_get(args, "parent") && !v3_get(args, "parent_instance"))
+        v3_add_u32(args, "parent_instance", v3_int(args, "parent", 1));
+    cJSON_AddItemToObject(params, "args", args);
     char *text = cJSON_PrintUnformatted(root);
     TEST_ASSERT_LESS_OR_EQUAL(LV_REQUEST_MAX, strlen(text));
     cJSON *r = v3_handle(&core, endpoint, generation, text, strlen(text), 1000);
@@ -895,8 +902,160 @@ static void test_rpc_batch_and_notice_allocation_failures(void) {
     cJSON_InitHooks(NULL);
     setUp();
 }
+
+static v3_rpc_pending *begin_json(cJSON *p) {
+    char *text = cJSON_PrintUnformatted(p);
+    cJSON_Delete(p);
+    v3_rpc_pending *pending = NULL;
+    size_t size;
+    char *out = v3_rpc_begin(&core, 0, 0, text, strlen(text), 1000, false, &size, &pending);
+    cJSON_free(text); // Pending owns raw IDs, even after the original request is released.
+    TEST_ASSERT_NULL(out);
+    TEST_ASSERT_NOT_NULL(pending);
+    return pending;
+}
+static cJSON *poll_json(v3_rpc_pending *pending) {
+    char *text;
+    size_t size;
+    TEST_ASSERT_TRUE(v3_rpc_poll(&core, pending, &text, &size));
+    TEST_ASSERT_NOT_NULL(text);
+    TEST_ASSERT_EQUAL(strlen(text), size);
+    cJSON *p = cJSON_Parse(text);
+    free(text);
+    v3_rpc_drop(&core, pending);
+    return p;
+}
+static void test_deferred_codec_bounds_whitespace_without_sentinel(void) {
+    const char raw[] = {' ', ' ', ' '};
+    v3_rpc_pending *pending = NULL;
+    size_t size;
+    char *text = v3_rpc_begin(&core, 0, 0, raw, sizeof(raw), 1000, false, &size, &pending);
+    TEST_ASSERT_NULL(pending);
+    TEST_ASSERT_NOT_NULL(text);
+    cJSON *p = cJSON_Parse(text);
+    TEST_ASSERT_EQUAL(-32700, error_number(p));
+    cJSON_Delete(p);
+    free(text);
+}
+static void test_a6_contract_identity_matches_sdk(void) {
+    cJSON *p = call("hello", "{}");
+    const cJSON *value = v3_get(v3_get(p, "result"), "value");
+    TEST_ASSERT_EQUAL_STRING("limivia-v3-jsonrpc2-r2", v3_str(value, "contract", ""));
+    TEST_ASSERT_EQUAL_STRING("0.3.0a7", v3_str(value, "firmware", ""));
+    cJSON_Delete(p);
+}
+static void test_direct_reply_waits_for_worker_and_keeps_heartbeat_available(void) {
+    connect_control();
+    cJSON *request = request_json(20, "resource.open",
+        "{\"kind\":\"gpio\",\"pins\":{\"pin\":13},\"config\":{\"mode\":\"output\",\"level\":1}}");
+    cJSON_DeleteItemFromObjectCaseSensitive(request, "id");
+    cJSON_AddRawToObject(request, "id", "9007199254740993");
+    v3_rpc_pending *pending = begin_json(request);
+    char *text;
+    size_t size;
+    TEST_ASSERT_FALSE(v3_rpc_poll(&core, pending, &text, &size));
+    TEST_ASSERT_NULL(text);
+    TEST_ASSERT_EQUAL(1, queued);
+    ok(send_json(request_json(21, "session.ping", "{}")));
+    v3_complete(&core, queue[0], 0, true,
+                cJSON_Parse("{\"mode\":\"output\",\"level\":1,\"enabled\":true}"));
+    v3_work_free(queue[0]); queue[0] = NULL;
+    TEST_ASSERT_TRUE(v3_rpc_poll(&core, pending, &text, &size));
+    TEST_ASSERT_NOT_NULL(strstr(text, "\"id\":9007199254740993,"));
+    cJSON *reply = cJSON_Parse(text);
+    const cJSON *value = v3_get(v3_get(reply, "result"), "value");
+    TEST_ASSERT_NULL(v3_get(value, "job_id"));
+    TEST_ASSERT_EQUAL(1, v3_int(value, "level", -1));
+    TEST_ASSERT_EQUAL(core.revision, v3_int(value, "revision", -1));
+    TEST_ASSERT_EQUAL_STRING("ready", v3_str(v3_get(value, "info"), "state", ""));
+    TEST_ASSERT_GREATER_THAN(0, v3_int(value, "observed_us", 0));
+    free(text); cJSON_Delete(reply);
+    v3_rpc_drop(&core, pending);
+}
+static void test_direct_batch_preserves_each_error_and_stop_cancels_pending(void) {
+    connect_control();
+    cJSON *batch = cJSON_CreateArray();
+    v3_push(batch, request_json(20, "resource.open",
+        "{\"kind\":\"gpio\",\"pins\":{\"pin\":13},\"config\":{}}"));
+    v3_push(batch, request_json(21, "not.an.operation", "{}"));
+    v3_rpc_pending *pending = begin_json(batch);
+    finish(0, 0);
+    cJSON *reply = poll_json(pending);
+    TEST_ASSERT_EQUAL(2, cJSON_GetArraySize(reply));
+    TEST_ASSERT_NOT_NULL(v3_get(cJSON_GetArrayItem(reply, 0), "result"));
+    TEST_ASSERT_NOT_NULL(v3_get(cJSON_GetArrayItem(reply, 1), "error"));
+    cJSON_Delete(reply);
+    v3_resource *r = &core.resources[0];
+    char args[160];
+    snprintf(args, sizeof(args), "{\"resource\":%lu,\"instance\":%lu,\"action\":\"write\",\"args\":{\"level\":0}}",
+             (unsigned long)r->id, (unsigned long)r->instance);
+    pending = begin_json(request_json(22, "resource.call", args));
+    ok(send_json(request_json(23, "outputs.stop", "{}")));
+    reply = poll_json(pending);
+    TEST_ASSERT_EQUAL_STRING("cancelled", v3_str(v3_get(v3_get(reply, "error"), "data"), "reason", ""));
+    cJSON_Delete(reply);
+    finish(1, 0);
+    TEST_ASSERT_NOT_EQUAL(V_READY, r->state);
+}
+static void test_expected_instance_is_checked_before_work_admission(void) {
+    connect_control();
+    uint32_t id = open_resource("{\"kind\":\"gpio\",\"pins\":{\"pin\":13},\"config\":{}}");
+    finish(0, 0);
+    char args[180];
+    snprintf(args, sizeof(args), "{\"resource\":%lu,\"instance\":999,\"action\":\"write\",\"args\":{\"level\":1}}", (unsigned long)id);
+    error(send_json(request_json(20, "resource.call", args)), "stale_instance");
+    snprintf(args, sizeof(args), "{\"resource\":%lu,\"action\":\"status\",\"args\":{}}", (unsigned long)id);
+    error(send_json(request_json(21, "resource.call", args)), "stale_instance");
+    TEST_ASSERT_EQUAL(1, queued);
+}
+static void test_dropping_direct_reply_unpins_completed_job(void) {
+    connect_control();
+    v3_rpc_pending *pending = begin_json(request_json(20, "resource.open",
+        "{\"kind\":\"gpio\",\"pins\":{\"pin\":13},\"config\":{}}"));
+    v3_job *j = v3_job_find(&core, queue[0]->job);
+    TEST_ASSERT_TRUE(j->reply_pending);
+    v3_disconnect(&core, 0, 1);
+    v3_rpc_drop(&core, pending);
+    TEST_ASSERT_FALSE(j->reply_pending);
+    finish(0, 0);
+    TEST_ASSERT_EQUAL(J_DONE, j->state); // Disconnect never replays or re-dispatches a write.
+    TEST_ASSERT_EQUAL(1, queued);
+}
+static void test_direct_completion_allocation_failures_never_reexecute(void) {
+    cJSON_Hooks hooks = {.malloc_fn = failing_alloc, .free_fn = failing_free};
+    cJSON_InitHooks(&hooks);
+    int sites = 1;
+    for (int fail = 0; fail <= sites; ++fail) {
+        setUp(); allocation_fail = 0;
+        connect_control();
+        v3_rpc_pending *pending = begin_json(request_json(20, "resource.open",
+            "{\"kind\":\"gpio\",\"pins\":{\"pin\":13},\"config\":{}}"));
+        finish(0, 0);
+        allocation_calls = 0; allocation_fail = fail;
+        char *out; size_t size;
+        TEST_ASSERT_TRUE(v3_rpc_poll(&core, pending, &out, &size));
+        if (!fail) sites = allocation_calls;
+        allocation_fail = 0;
+        TEST_ASSERT_NOT_NULL(out);
+        TEST_ASSERT_EQUAL(1, queued);
+        cJSON *reply = cJSON_Parse(out);
+        TEST_ASSERT_NOT_NULL(reply);
+        cJSON_Delete(reply); free(out);
+        v3_rpc_drop(&core, pending);
+        tearDown();
+        TEST_ASSERT_EQUAL(0, allocation_live);
+    }
+    cJSON_InitHooks(NULL);
+}
 int main(void) {
     UNITY_BEGIN();
+    RUN_TEST(test_deferred_codec_bounds_whitespace_without_sentinel);
+    RUN_TEST(test_a6_contract_identity_matches_sdk);
+    RUN_TEST(test_direct_reply_waits_for_worker_and_keeps_heartbeat_available);
+    RUN_TEST(test_direct_batch_preserves_each_error_and_stop_cancels_pending);
+    RUN_TEST(test_expected_instance_is_checked_before_work_admission);
+    RUN_TEST(test_dropping_direct_reply_unpins_completed_job);
+    RUN_TEST(test_direct_completion_allocation_failures_never_reexecute);
     RUN_TEST(test_strict_json);
     RUN_TEST(test_versions_and_sessions);
     RUN_TEST(test_pin_protection_and_atomic_preflight);

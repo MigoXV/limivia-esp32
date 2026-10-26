@@ -15,6 +15,18 @@ from limivia_esp32.validation import VerificationFailure
 class V3Client(Client):
     protocol_version = 3
 
+    def make_request(self, op, params=None, *, notify=False):
+        params = dict(params or {})
+        instances = getattr(self, "instances", {})
+        if op in {"resource.call", "resource.close", "resource.recover"} and params.get("resource") in instances:
+            params.setdefault("instance", instances[params["resource"]])
+        if params.get("parent") in instances:
+            params.setdefault("parent_instance", instances[params["parent"]])
+        if op in {"gpio.group.read", "gpio.group.write", "rmt.sync"}:
+            params["resources"] = [dict(item, instance=item.get("instance", instances.get(item["resource"], 0)))
+                                   for item in params["resources"]]
+        return super().make_request(op, params, notify=notify)
+
     async def job(self, op: str, params: dict | None = None, timeout: float = 20) -> dict:
         accepted = await self.request(op, params)
         if "job_id" not in accepted:
@@ -55,10 +67,15 @@ class V3Client(Client):
         accepted = await self.request(
             "resource.open", {"kind": kind, "pins": pins, "config": config or {}, **options}
         )
+        if "job_id" not in accepted:
+            self.instances = {**getattr(self, "instances", {}), accepted["resource"]: accepted["instance"]}
+            return accepted["resource"]
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             job = await self.request("job.get", {"job_id": accepted["job_id"]})
             if job["state"] == "completed":
+                info = await self.request("resource.get", {"resource": accepted["resource"]})
+                self.instances = {**getattr(self, "instances", {}), info["id"]: info["instance"]}
                 return accepted["resource"]
             if job["state"] != "accepted":
                 raise RuntimeError(f"资源创建失败: {job}")

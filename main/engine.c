@@ -85,7 +85,7 @@ static v3_job *new_job(v3_core *c, const char *action) {
             old = j;
             break;
         }
-        if (j->state != J_QUEUED && (!old || old->id > j->id))
+        if (j->state != J_QUEUED && !j->reply_pending && (!old || old->id > j->id))
             old = j;
     }
     if (!old || c->next_id >= 2147483647)
@@ -224,7 +224,7 @@ void v3_complete(v3_core *c, v3_work *w, int error, bool external, cJSON *result
         j->result_bytes = json_bytes(result);
         for (int i = 0; i < V3_JOBS && c->retained_result_bytes + j->result_bytes > 32768; ++i) {
             v3_job *old = &c->jobs[i];
-            if (old == j || !old->result || old->state == J_QUEUED)
+            if (old == j || !old->result || old->state == J_QUEUED || old->reply_pending)
                 continue;
             c->retained_result_bytes -= old->result_bytes;
             old->result_bytes = 0;
@@ -266,6 +266,8 @@ void v3_complete(v3_core *c, v3_work *w, int error, bool external, cJSON *result
     // Transactions may return NACK/no-data/timeout without poisoning an initialized controller.
     // A stop during open retains the reservation until an explicit close completes.
     ++c->revision;
+    j->revision = c->revision;
+    j->observed_us = c->now * 1000;
 }
 void v3_tick(v3_core *c, int64_t now) {
     c->now = now;
@@ -450,10 +452,11 @@ static cJSON *operate(v3_core *c, int endpoint, const char *op, const cJSON *p,
         v3_resource *resources[11];
         for (int i = 0; i < count; ++i) {
             const cJSON *item = cJSON_GetArrayItem(items, i);
-            if (!v3_keys(item, sync    ? "resource data"
-                               : write ? "resource level"
-                                       : "resource") ||
+            if (!v3_keys(item, sync    ? "resource instance data"
+                               : write ? "resource instance level"
+                                       : "resource instance") ||
                 !v3_integer(v3_get(item, "resource"), 1, 2147483647) ||
+                !v3_integer(v3_get(item, "instance"), 1, 2147483647) ||
                 (write && !v3_integer(v3_get(item, "level"), 0, 1)) ||
                 (sync && !cJSON_IsString(v3_get(item, "data")))) {
                 *error = "invalid_argument";
@@ -461,7 +464,8 @@ static cJSON *operate(v3_core *c, int endpoint, const char *op, const cJSON *p,
             }
             resources[i] = v3_find(c, v3_int(item, "resource", 0));
             v3_resource *r = resources[i];
-            if (!r || r->kind != (sync ? V_RMT_TX : V_GPIO) || r->state != V_READY) {
+            if (!r || r->instance != (uint32_t)v3_int(item, "instance", 0) ||
+                r->kind != (sync ? V_RMT_TX : V_GPIO) || r->state != V_READY) {
                 *error = "invalid_resource";
                 return NULL;
             }
@@ -632,6 +636,11 @@ static cJSON *operate(v3_core *c, int endpoint, const char *op, const cJSON *p,
         v3_resource *r = v3_find(c, v3_int(p, "resource", 0));
         if (!r) {
             *error = "resource_not_found";
+            return NULL;
+        }
+        if (!v3_integer(v3_get(p, "instance"), 1, 2147483647) ||
+            r->instance != (uint32_t)v3_int(p, "instance", 0)) {
+            *error = "stale_instance";
             return NULL;
         }
         v3_resource *parent = v3_find(c, r->parent);

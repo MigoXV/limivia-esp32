@@ -11,7 +11,9 @@ bool lv_tx_frame(lv_tx_io io, uint32_t generation, size_t payload, const char *t
             break;
         if (rc > 0)
             offset += n;
-        if (offset < size)
+        // Yield only on controller backpressure. Successful fragments are already
+        // handed to the NimBLE host; a fixed delay per fragment throttles pages.
+        if (!rc)
             io.pause(io.context);
     }
     if (offset == size)

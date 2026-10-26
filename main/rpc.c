@@ -186,7 +186,7 @@ static cJSON *hello(v3_core *c, int endpoint, const call *r) {
     cJSON_AddStringToObject(p, "device_id", c->device);
     cJSON_AddStringToObject(p, "boot_id", c->boot);
     cJSON_AddStringToObject(p, "board", "luatos-esp32c3-usb");
-    cJSON_AddStringToObject(p, "firmware", "0.3.0-dev");
+    cJSON_AddStringToObject(p, "firmware", "0.3.0a7");
     cJSON_AddStringToObject(p, "build_id", c->build);
     cJSON_AddStringToObject(p, "profile", c->profile);
     cJSON_AddStringToObject(p, "jsonrpc", "2.0");
@@ -318,9 +318,23 @@ static bool expand(rpc_buffer *b, size_t minimum) {
     b->cap = cap;
     return true;
 }
+struct v3_rpc_pending {
+    char input[LV_REQUEST_MAX + 1];
+    cJSON *replies[LV_RPC_BATCH_MAX];
+    span ids[LV_RPC_BATCH_MAX];
+    uint32_t jobs[LV_RPC_BATCH_MAX];
+    int count, endpoint;
+    bool batch, deferred;
+    rpc_buffer buffer;
+};
+static bool direct_job(v3_core *c, uint32_t id) {
+    v3_job *j = v3_job_find(c, id);
+    v3_resource *r = j ? v3_find(c, j->resource) : NULL;
+    return r && v3_action_direct(r->kind, j->action);
+}
 static size_t encode_message(v3_core *c, int endpoint, uint32_t generation,
                               const char *text, size_t n, int64_t now, bool retained,
-                              rpc_buffer *b) {
+                              rpc_buffer *b, v3_rpc_pending *pending) {
     if (endpoint < 0 || endpoint >= V3_ENDPOINTS || n > LV_REQUEST_MAX || b->cap < 2)
         return 0;
     if (b->cap > LV_RESPONSE_MAX + 2)
@@ -425,7 +439,18 @@ static size_t encode_message(v3_core *c, int endpoint, uint32_t generation,
                 break;
             // Re-encode this retained result after growing, never re-dispatch a call.
         } while (valid && b->cap < LV_RESPONSE_MAX + 2 && expand(b, b->cap + 1));
-        cJSON_Delete(p);
+        if (pending) {
+            int slot = pending->count++;
+            pending->replies[slot] = p;
+            pending->ids[slot] = (span){r->id.text ? pending->input + (r->id.text - text) : NULL,
+                                        r->id.size};
+            if (!r->code && job && direct_job(c, job)) {
+                pending->jobs[slot] = job;
+                pending->deferred = true;
+                v3_job_find(c, job)->reply_pending = true;
+            }
+        } else
+            cJSON_Delete(p);
         size_t available = b->cap - used - remaining - 3;
         if (!length || length > available)
             length = capacity(c, endpoint, r->id, job, b->text + used, b->cap - used);
@@ -448,7 +473,7 @@ static size_t encode_message(v3_core *c, int endpoint, uint32_t generation,
 size_t v3_rpc_wire(v3_core *c, int endpoint, uint32_t generation, const char *text, size_t n,
                    int64_t now, bool retained, char *out, size_t cap) {
     rpc_buffer b = {.text = out, .cap = cap};
-    return encode_message(c, endpoint, generation, text, n, now, retained, &b);
+    return encode_message(c, endpoint, generation, text, n, now, retained, &b, NULL);
 }
 char *v3_rpc_alloc(v3_core *c, int endpoint, uint32_t generation, const char *text, size_t n,
                     int64_t now, bool retained, size_t *size) {
@@ -457,7 +482,7 @@ char *v3_rpc_alloc(v3_core *c, int endpoint, uint32_t generation, const char *te
         *size = SIZE_MAX;
         return NULL;
     }
-    *size = encode_message(c, endpoint, generation, text, n, now, retained, &b);
+    *size = encode_message(c, endpoint, generation, text, n, now, retained, &b, NULL);
     if (!*size) {
         free(b.text);
         if (b.allocation_failed)
@@ -465,6 +490,134 @@ char *v3_rpc_alloc(v3_core *c, int endpoint, uint32_t generation, const char *te
         return NULL;
     }
     return b.text;
+}
+void v3_rpc_drop(v3_core *c, v3_rpc_pending *p) {
+    if (!p)
+        return;
+    for (int i = 0; i < p->count; ++i) {
+        v3_job *j = v3_job_find(c, p->jobs[i]);
+        if (j)
+            j->reply_pending = false;
+        cJSON_Delete(p->replies[i]);
+    }
+    free(p->buffer.text);
+    free(p);
+}
+char *v3_rpc_begin(v3_core *c, int endpoint, uint32_t generation, const char *text, size_t n,
+                    int64_t now, bool retained, size_t *size, v3_rpc_pending **out) {
+    *out = NULL;
+    *size = SIZE_MAX;
+    if (n > LV_REQUEST_MAX)
+        return NULL;
+    // Reserve frame ownership and all reply associations before dispatching any side effect.
+    v3_rpc_pending *p = calloc(1, sizeof(*p));
+    if (!p)
+        return NULL;
+    memcpy(p->input, text, n);
+    p->endpoint = endpoint;
+    size_t start = whitespace(text, 0, n);
+    p->batch = start < n && text[start] == '[';
+    p->buffer = (rpc_buffer){.text = malloc(512), .cap = 512, .grow = true};
+    if (!p->buffer.text) {
+        free(p);
+        return NULL;
+    }
+    *size = encode_message(c, endpoint, generation, text, n, now, retained, &p->buffer, p);
+    if (!*size) {
+        bool failed = p->buffer.allocation_failed;
+        v3_rpc_drop(c, p);
+        if (failed)
+            *size = SIZE_MAX;
+        return NULL;
+    }
+    if (p->deferred) {
+        *out = p;
+        return NULL;
+    }
+    char *result = p->buffer.text;
+    p->buffer.text = NULL;
+    v3_rpc_drop(c, p);
+    return result;
+}
+bool v3_rpc_poll(v3_core *c, v3_rpc_pending *p, char **text, size_t *size) {
+    *text = NULL;
+    *size = 0;
+    for (int i = 0; i < p->count; ++i) {
+        v3_job *j = v3_job_find(c, p->jobs[i]);
+        if (j && j->state == J_QUEUED && j->epoch == c->epoch)
+            return false;
+    }
+    size_t used = p->batch ? 1 : 0;
+    if (p->batch)
+        p->buffer.text[0] = '[';
+    for (int i = 0; i < p->count; ++i) {
+        cJSON *response = p->replies[i];
+        if (p->jobs[i]) {
+            v3_job *j = v3_job_find(c, p->jobs[i]);
+            call r = {.id = p->ids[i]};
+            unsigned failures = v3_json_failures();
+            cJSON *value = NULL;
+            if (!j || j->epoch != c->epoch || j->state == J_CANCELLED)
+                reject(&r, 1000, "cancelled");
+            else if (j->state != J_DONE)
+                reject(&r, 1000, v3_str(j->result, "error_code", "driver_error"));
+            else {
+                value = j->result ? cJSON_Duplicate(j->result, true) : cJSON_CreateObject();
+                v3_add_u32(value, "resource", j->resource);
+                v3_add_u32(value, "instance", j->instance);
+                v3_add_u32(value, "revision", j->revision);
+                cJSON_AddNumberToObject(value, "observed_us", (double)j->observed_us);
+                if (!strcmp(j->action, "open")) {
+                    v3_resource *resource = v3_find(c, j->resource);
+                    if (resource && resource->instance == j->instance)
+                        v3_put(value, "info", v3_resource_json(resource));
+                }
+            }
+            cJSON *next = reply(c, p->endpoint, &r, value);
+            if (r.code && next) {
+                cJSON *data = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(next, "error"), "data");
+                cJSON_AddNumberToObject(data, "driver_error", j ? j->error : 0);
+                cJSON_AddBoolToObject(data, "external_effect_possible", !j || j->external_effect);
+            }
+            if (failures != v3_json_failures()) {
+                cJSON_Delete(next);
+                next = NULL;
+            }
+            cJSON_Delete(response);
+            p->replies[i] = response = next;
+        }
+        if (i && p->batch)
+            p->buffer.text[used++] = ',';
+        size_t reserved = 3;
+        for (int k = i + 1; k < p->count; ++k)
+            reserved += capacity(c, p->endpoint, p->ids[k], UINT32_MAX, NULL, 0) + V3_TOKEN + 1;
+        size_t length = 0;
+        do {
+            length = 0;
+            if (response && cJSON_PrintPreallocated(response, p->buffer.text + used,
+                                                    (int)(p->buffer.cap - used), false))
+                length = strlen(p->buffer.text + used);
+            if (length && used + length + reserved <= p->buffer.cap)
+                break;
+        } while (response && p->buffer.cap < LV_RESPONSE_MAX + 2 &&
+                 expand(&p->buffer, p->buffer.cap + 1));
+        if (!length || used + length + reserved > p->buffer.cap)
+            length = capacity(c, p->endpoint, p->ids[i], p->jobs[i], p->buffer.text + used,
+                              p->buffer.cap - used);
+        if (!length || used + length + reserved > p->buffer.cap) {
+            *size = SIZE_MAX;
+            return true;
+        }
+        used += length;
+    }
+    if (p->batch)
+        p->buffer.text[used++] = ']';
+    p->buffer.text[used++] = '\n';
+    p->buffer.text[used] = 0;
+    *text = p->buffer.text;
+    p->buffer.text = NULL;
+    *size = used;
+    return true;
 }
 int v3_rpc_priority(const char *text, size_t n) {
     cJSON *root = v3_parse(text, n);

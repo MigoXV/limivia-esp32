@@ -10,6 +10,8 @@
 #include "esp_timer.h"
 #include "mqtt_client.h"
 #include "nvs.h"
+#include "lwip/sockets.h"
+#include "lwip/tcp.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -64,24 +66,28 @@ static void ws_closed(void *ctx) {
     xSemaphoreGive(route_lock);
     control_wake();
 }
-static esp_err_t ws_handler(httpd_req_t *req) {
-    if (req->method == HTTP_GET) {
-        xSemaphoreTake(route_lock, portMAX_DELAY);
-        int slot = -1;
-        for (int i = 0; i < 2; ++i)
-            if (ws_fd[i] < 0) {
-                slot = i;
-                break;
-            }
-        if (slot >= 0) {
-            ws_fd[slot] = httpd_req_to_sockfd(req);
-            atomic_fetch_add(&routes[slot], 1);
-            req->sess_ctx = (void *)(intptr_t)(slot + 1);
-            req->free_ctx = ws_closed;
+// IDF 6 does not invoke the frame handler for the HTTP upgrade itself.
+static esp_err_t ws_connected(httpd_req_t *req) {
+    int fd = httpd_req_to_sockfd(req), one = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0)
+        return ESP_FAIL;
+    xSemaphoreTake(route_lock, portMAX_DELAY);
+    int slot = -1;
+    for (int i = 0; i < 2; ++i)
+        if (ws_fd[i] < 0) {
+            slot = i;
+            break;
         }
-        xSemaphoreGive(route_lock);
-        return slot < 0 ? ESP_ERR_NO_MEM : ESP_OK;
+    if (slot >= 0) {
+        ws_fd[slot] = fd;
+        atomic_fetch_add(&routes[slot], 1);
+        req->sess_ctx = (void *)(intptr_t)(slot + 1);
+        req->free_ctx = ws_closed;
     }
+    xSemaphoreGive(route_lock);
+    return slot < 0 ? ESP_ERR_NO_MEM : ESP_OK;
+}
+static esp_err_t ws_handler(httpd_req_t *req) {
     int slot = (intptr_t)req->sess_ctx - 1;
     if (slot < 0 || slot >= 2)
         return ESP_FAIL;
@@ -89,7 +95,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     int err = httpd_ws_recv_frame(req, &frame, 0);
     if (err)
         return err;
-    if (frame.type != HTTPD_WS_TYPE_TEXT || frame.len > LV_REQUEST_MAX + 1 || frame.fragmented)
+    if (frame.type != HTTPD_WS_TYPE_TEXT || !frame.len || frame.len > LV_REQUEST_MAX + 1 || !frame.final)
         return ESP_ERR_INVALID_ARG;
     char *text = malloc(frame.len + 1);
     if (!text)
@@ -324,7 +330,8 @@ static int ensure_driver(void) {
         if (wifi_error)
             return wifi_error;
         httpd_uri_t uri = {
-            .uri = "/v3", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true};
+            .uri = "/v3", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true,
+            .ws_post_handshake_cb = ws_connected};
         wifi_error = httpd_register_uri_handler(server, &uri);
         if (wifi_error)
             return wifi_error;

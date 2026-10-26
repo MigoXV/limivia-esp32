@@ -106,13 +106,13 @@ static const operation operations[] = {
     {"state", "page revision"},
     {"diagnostics", ""},
     {"mux.query", "page revision"},
-    {"mux.preflight", "kind parent controller pins config"},
-    {"resource.preflight", "kind parent controller pins config"},
-    {"resource.open", "kind parent controller pins config"},
+    {"mux.preflight", "kind parent parent_instance controller pins config"},
+    {"resource.preflight", "kind parent parent_instance controller pins config"},
+    {"resource.open", "kind parent parent_instance controller pins config"},
     {"resource.get", "resource"},
-    {"resource.close", "resource cascade"},
-    {"resource.recover", "resource cascade"},
-    {"resource.call", "resource action args"},
+    {"resource.close", "resource instance cascade"},
+    {"resource.recover", "resource instance cascade"},
+    {"resource.call", "resource instance action args"},
     {"job.get", "job_id"},
     {"job.cancel", "job_id"},
     {"gpio.group.read", "resources"},
@@ -197,7 +197,7 @@ const char *v3_operation_validate(const char *name, const cJSON *p) {
         return "unknown_operation";
     if (!v3_keys(p, op->keys))
         return "invalid_argument";
-    static const char *const ids[] = {"resource", "job_id", "buffer_id", "upload_id", "flow_id"};
+    static const char *const ids[] = {"resource", "instance", "parent_instance", "job_id", "buffer_id", "upload_id", "flow_id"};
     for (size_t i = 0; i < sizeof(ids) / sizeof(*ids); ++i)
         if (v3_get(p, ids[i]) && !v3_integer(v3_get(p, ids[i]), 1, 2147483647))
             return "invalid_argument";
@@ -285,6 +285,11 @@ bool v3_action_readonly(v3_kind k, const char *a) {
     return !strcmp(a, "status") || (k == V_GPIO && !strcmp(a, "read")) ||
            (k == V_TEMPERATURE && !strcmp(a, "read")) || (k == V_TWAI && !strcmp(a, "info"));
 }
+bool v3_action_direct(v3_kind kind, const char *action) {
+    return (kind == V_GPIO && (!strcmp(action, "open") || !strcmp(action, "read") ||
+            !strcmp(action, "write") || !strcmp(action, "status"))) ||
+           (kind == V_PWM && (!strcmp(action, "duty") || !strcmp(action, "status")));
+}
 cJSON *v3_actions_json(v3_kind kind) {
     cJSON *a = cJSON_CreateArray();
     for (size_t i = 0; i < sizeof(actions) / sizeof(*actions); ++i) {
@@ -294,6 +299,7 @@ cJSON *v3_actions_json(v3_kind kind) {
         cJSON *p = cJSON_CreateObject();
         cJSON_AddStringToObject(p, "action", v->name);
         cJSON_AddBoolToObject(p, "payload", v->payload);
+        cJSON_AddStringToObject(p, "completion", v3_action_direct(kind, v->name) ? "direct" : "job");
         cJSON *args = cJSON_AddArrayToObject(p, "args");
         for (size_t j = 0; j < v->count; ++j) {
             const argument *f = &v->args[j];
